@@ -51,6 +51,7 @@
 #include <FastAccelStepper.h>
 #include <TMCStepper.h>
 #include <Preferences.h>
+#include <freertos/queue.h>
 
 // Forward declaration
 struct MotorState;
@@ -92,7 +93,7 @@ const char* WIFI_PASS = "windows12";
 // ---------------------------------------------------------------------------
 #define R_SENSE           0.11f // Sense resistor on BIGTREETECH TMC2209 V1.3 (0.11 Ohm)
 #define DRIVER_ADDRESS    0b00  // TMC2209 UART address (MS1=GND, MS2=GND -> 0b00)
-#define RMS_CURRENT_MA    950   // RMS current in mA for Usongshine 17HS4023 (1.0A peak rating)
+#define RMS_CURRENT_MA    900   // RMS current in mA for Usongshine 17HS4023 (0.90A reduced from 0.95A to keep motors cool)
 #define MICROSTEPS_VAL    16    // 1/16 microstepping via UART register
 
 // ---------------------------------------------------------------------------
@@ -119,7 +120,7 @@ const char* WIFI_PASS = "windows12";
 #define MIN_SPEED_HZ         150   // Slowest creep speed at deadzone threshold
 #define ACCEL_HZ_S         25000   // Operational acceleration ramp (steps/s^2)
 #define JOY_DEAD              60   // Command deadzone (out of +/-1000)
-#define RX_TIMEOUT_MS        800   // Failsafe link-loss timeout (ms)
+#define RX_TIMEOUT_MS        2500  // Failsafe link-loss timeout (ms) - generous margin for dual-stick motion
 #define PWR_SETTLE_DELAY_MS 2000   // Wait for 12V rail & driver logic to stabilize
 
 // ---------------------------------------------------------------------------
@@ -140,14 +141,27 @@ const char* WIFI_PASS = "windows12";
 // ---------------------------------------------------------------------------
 // Sony FDR-AX53 IR Zoom Configuration (40 kHz, 15-bit SIRC)
 // ---------------------------------------------------------------------------
-#define SONY_IR_CARRIER_HZ      40000 // Sony standard carrier frequency
-#define SONY_IR_ADDR_CAM        0xD9  // Sony Camcorder Address
-#define SONY_IR_CMD_ZOOM_TELE   0x1A  // Zoom Telephoto (In)
-#define SONY_IR_CMD_ZOOM_WIDE   0x1B  // Zoom Wide (Out)
+#define SONY_IR_CARRIER_HZ      40000 // Sony standard carrier frequency (40 kHz, 33% duty)
+#define SONY_IR_ADDR_CAM        0xD9  // Sony Camcorder Address (0xD9)
+#define SONY_IR_CMD_ZOOM_TELE   0x1A  // Zoom Telephoto / In  (0x1A)
+#define SONY_IR_CMD_ZOOM_WIDE   0x1B  // Zoom Wide / Out      (0x1B)
 
-// Dead-Reckoning Zoom Timing Model (Calibrated for Sony FDR-AX53 full optical travel)
-#define ZOOM_FULL_RANGE_MS      7000  // ~7.0s full optical zoom travel (0 = Wide, 7000 = Tele)
-#define ZOOM_HOMING_TIME_MS     8500  // Zoom out continuously for 8.5s to hit physical wide stop
+// ---------------------------------------------------------------------------
+// Dead-Reckoning Zoom Timing Model (Sony FDR-AX53 Optical Travel)
+// ---------------------------------------------------------------------------
+// CALIBRATION: Standard Sony FDR-AX53 optical travel time from 0% (Wide) to 100% (Tele)
+// is ~3500 ms (3.5s) at the 45ms Sony repeat rate.
+// To fine-tune for your specific setup: adjust ZOOM_FULL_RANGE_MS to your measured travel time!
+#define ZOOM_FULL_RANGE_MS     13000  // Full optical zoom travel in ms (0 = Wide, 13000 = Tele ~ 13.0s)
+#define ZOOM_FRAME_MS             45  // Sony SIRC repeat period (25.5ms packet + 19.5ms gap)
+#define ZOOM_TICK_MS   ZOOM_FRAME_MS  // Cadence tick step for dead-reckoning (45 ms)
+#define ZOOM_HOMING_TIME_MS    14500  // Continuous Wide drive duration during startup homing (14.5s)
+#define ZOOM_ACTIVE_WINDOW_MS    150  // Active window for fast telemetry updates during zoom
+#define ZOOM_FAST_TELEMETRY_MS   100  // Interval for fast telemetry while zooming
+
+// Zoom-Adaptive Dynamic Speed Scaling (Focal Length Adaptive)
+#define ZOOM_SPEED_SCALE_MIN    0.20f // At 100% Tele, Pan/Tilt max speed scales down to 20% of normal
+#define ZOOM_ACCEL_SCALE_MIN    0.35f // At 100% Tele, Pan/Tilt acceleration scales down to 35% of normal
 
 // LEDC PWM Channel for IR Carrier
 const uint8_t IR_LEDC_CH = 0;
@@ -307,115 +321,176 @@ inline void irCarrierOff() {
 }
 
 // Transmit single 15-bit Sony SIRC packet (40 kHz modulated)
+// Timings matched from genuine Sony FDR-AX53 remote captures:
+// Header: 2450us ON, 550us OFF
+// Bit 1 : 1250us ON, 550us OFF
+// Bit 0 :  650us ON, 550us OFF
 void sendSony15Packet(uint8_t address, uint8_t command) {
-  // Header: 2400us mark, 600us space
+  noInterrupts(); // Ensure zero pulse jitter during 25ms packet
+
+  // Header: 2450us mark, 550us space
   irCarrierOn();
-  delayMicroseconds(2400);
+  delayMicroseconds(2450);
   irCarrierOff();
-  delayMicroseconds(600);
+  delayMicroseconds(550);
 
   // 7-bit Command (LSB first)
   for (uint8_t i = 0; i < 7; i++) {
     irCarrierOn();
     if ((command >> i) & 1) {
-      delayMicroseconds(1200);
+      delayMicroseconds(1250);
     } else {
-      delayMicroseconds(600);
+      delayMicroseconds(650);
     }
     irCarrierOff();
-    delayMicroseconds(600);
+    delayMicroseconds(550);
   }
 
   // 8-bit Address (LSB first)
   for (uint8_t i = 0; i < 8; i++) {
     irCarrierOn();
     if ((address >> i) & 1) {
-      delayMicroseconds(1200);
+      delayMicroseconds(1250);
     } else {
-      delayMicroseconds(600);
+      delayMicroseconds(650);
     }
     irCarrierOff();
-    delayMicroseconds(600);
+    delayMicroseconds(550);
   }
+
+  interrupts();
 }
 
 // ---------------------------------------------------------------------------
-// Dead-Reckoning Zoom Engine (Variable Speed & Soft Limits)
+// Non-Blocking Sony SIRC IR Transmitter (Dedicated Task + Precision Cadence)
+// ---------------------------------------------------------------------------
+// Pinned to Core 0 at priority 1 to keep Core 1 100% dedicated to FastAccelStepper.
+// Uses canonical FreeRTOS vTaskDelayUntil for strictly deterministic 45.0 ms start-to-start timing.
+volatile uint8_t  g_irActiveCmd     = 0;
+volatile uint32_t g_irActiveUntilMs = 0;
+volatile uint32_t irLastCmdMs       = 0;
+
+void irTransmitTask(void* pvParameters) {
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  const TickType_t xFrequency = pdMS_TO_TICKS(45); // Exact 45 ms period
+
+  while (true) {
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+
+    uint32_t nowMs = millis();
+    if (g_irActiveCmd != 0 && nowMs < g_irActiveUntilMs) {
+      sendSony15Packet(SONY_IR_ADDR_CAM, g_irActiveCmd);
+      irLastCmdMs = millis();
+    }
+  }
+}
+
+// Backward-compatible non-blocking queue/command trigger
+bool queueIrCommand(uint8_t cmd) {
+  g_irActiveCmd = cmd;
+  g_irActiveUntilMs = millis() + 180;
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Dead-Reckoning Zoom Engine (Direct Wall-Clock Integration & Soft Limits)
 // ---------------------------------------------------------------------------
 void homeZoom() {
-  Serial.println("\n[Zoom Homing] Starting: Driving Wide to physical lens stop (5.5s)...");
-  uint32_t startMs = millis();
-  while (millis() - startMs < ZOOM_HOMING_TIME_MS) {
-    sendSony15Packet(SONY_IR_ADDR_CAM, SONY_IR_CMD_ZOOM_WIDE);
-    delay(40);
-  }
+  Serial.printf("\n[Zoom Homing] Starting: Driving Wide to physical lens stop (%u ms)...\n", ZOOM_HOMING_TIME_MS);
+  g_irActiveCmd = SONY_IR_CMD_ZOOM_WIDE;
+  g_irActiveUntilMs = millis() + ZOOM_HOMING_TIME_MS;
+  delay(ZOOM_HOMING_TIME_MS);
+  g_irActiveCmd = 0;
+  g_irActiveUntilMs = 0;
   currentZoomMs = 0;
   isZoomHomed = true;
   Serial.println("[Zoom Homing] Completed! Calibrated at 0.0% Wide (0 ms).\n");
 }
 
-// Handle real-time manual zoom commands from joystick (Single reliable standard rate)
+// Handle real-time manual zoom commands from joystick (Sony 45 ms framing via IR TX task)
 void applyZoom(int16_t cmd) {
-  static uint32_t lastZoomTickMs = 0;
+  static uint32_t lastZoomActiveMs = 0;
   uint32_t now = millis();
 
   if (abs(cmd) < JOY_DEAD) {
-    return; // Center deadzone -> idle
+    lastZoomActiveMs = 0;
+    return; // Center deadzone -> idle (let in-flight 180ms window cleanly expire)
   }
 
   bool zoomIn = (cmd > 0);
 
   // Soft Limit Guard: Prevent driving past mechanical stops (0..ZOOM_FULL_RANGE_MS)
-  if (zoomIn && currentZoomMs >= ZOOM_FULL_RANGE_MS) return;
-  if (!zoomIn && currentZoomMs <= 0) return;
+  if (zoomIn && currentZoomMs >= ZOOM_FULL_RANGE_MS) {
+    lastZoomActiveMs = 0;
+    g_irActiveCmd = 0;
+    g_irActiveUntilMs = 0;
+    return;
+  }
+  if (!zoomIn && currentZoomMs <= 0) {
+    lastZoomActiveMs = 0;
+    g_irActiveCmd = 0;
+    g_irActiveUntilMs = 0;
+    return;
+  }
 
-  // Maintain Sony standard 42 ms repeat framing base tick
-  if (now - lastZoomTickMs < 42) return;
-  lastZoomTickMs = now;
+  // Calculate elapsed time while actively driving zoom
+  uint32_t elapsedMs = 0;
+  if (lastZoomActiveMs != 0) {
+    elapsedMs = now - lastZoomActiveMs;
+    if (elapsedMs > 100) elapsedMs = 100; // Guard against packet delay spikes
+  }
+  lastZoomActiveMs = now;
 
+  // Signal continuous IR transmission: keep alive for 180 ms (auto-refreshed by 50 Hz control stream)
   uint8_t code = zoomIn ? SONY_IR_CMD_ZOOM_TELE : SONY_IR_CMD_ZOOM_WIDE;
-  sendSony15Packet(SONY_IR_ADDR_CAM, code);
+  g_irActiveCmd = code;
+  g_irActiveUntilMs = now + 180;
 
-  // Virtual position tracking (dead-reckoning: 42ms elapsed per tick)
+  // Dead-reckoning tracks exact elapsed wall-clock travel time (0..ZOOM_FULL_RANGE_MS)
   if (zoomIn) {
-    currentZoomMs += 42;
+    currentZoomMs += elapsedMs;
     if (currentZoomMs > ZOOM_FULL_RANGE_MS) currentZoomMs = ZOOM_FULL_RANGE_MS;
   } else {
-    currentZoomMs -= 42;
+    currentZoomMs -= elapsedMs;
     if (currentZoomMs < 0) currentZoomMs = 0;
   }
 }
 
-// Coordinated Preset Zoom Smooth Transition
+// Coordinated Preset Zoom Smooth Transition (enqueues IR frames non-blocking)
 void updatePresetZoomMove() {
   if (!isMovingToPreset) return;
 
-  static uint32_t lastPresetStepMs = 0;
   uint32_t now = millis();
+  static uint32_t lastPresetStepMs = 0;
+
+  uint32_t elapsedMs = 0;
+  if (lastPresetStepMs != 0) {
+    elapsedMs = now - lastPresetStepMs;
+    if (elapsedMs > 100) elapsedMs = 100;
+  }
+  lastPresetStepMs = now;
 
   int32_t diff = (int32_t)targetZoomMs - (int32_t)currentZoomMs;
 
-  if (abs(diff) < 42) {
-    // Within 1 IR frame tolerance: snap exact target
+  if (abs(diff) <= 25) {
     currentZoomMs = targetZoomMs;
+    lastPresetStepMs = 0;
+    g_irActiveCmd = 0;
+    g_irActiveUntilMs = 0;
     return;
   }
 
-  // Sony 42 ms repeat framing
-  if (now - lastPresetStepMs >= 42) {
-    bool zoomIn = (diff > 0);
-    uint8_t code = zoomIn ? SONY_IR_CMD_ZOOM_TELE : SONY_IR_CMD_ZOOM_WIDE;
-    sendSony15Packet(SONY_IR_ADDR_CAM, code);
+  bool zoomIn = (diff > 0);
+  uint8_t code = zoomIn ? SONY_IR_CMD_ZOOM_TELE : SONY_IR_CMD_ZOOM_WIDE;
+  g_irActiveCmd = code;
+  g_irActiveUntilMs = now + 100;
 
-    if (zoomIn) {
-      currentZoomMs += 42;
-      if (currentZoomMs > (int32_t)targetZoomMs) currentZoomMs = targetZoomMs;
-    } else {
-      currentZoomMs -= 42;
-      if (currentZoomMs < (int32_t)targetZoomMs) currentZoomMs = targetZoomMs;
-    }
-
-    lastPresetStepMs = now;
+  if (zoomIn) {
+    currentZoomMs += elapsedMs;
+    if (currentZoomMs > (int32_t)targetZoomMs) currentZoomMs = targetZoomMs;
+  } else {
+    currentZoomMs -= elapsedMs;
+    if (currentZoomMs < (int32_t)targetZoomMs) currentZoomMs = targetZoomMs;
   }
 }
 
@@ -584,8 +659,8 @@ void gotoPreset(uint8_t id) {
     }
   }
 
-  // Zoom move
-  targetZoomMs = presets[idx].zoom;
+  // Zoom move (clamp to calibrated optical range, so stale presets can never over-drive)
+  targetZoomMs = min((uint32_t)presets[idx].zoom, (uint32_t)ZOOM_FULL_RANGE_MS);
   isMovingToPreset = true;
 
   char evt[32];
@@ -663,11 +738,11 @@ bool setupTMC2209(TMC2209Stepper& driver, const char* name, uint8_t txPin, uint8
   uint8_t ifcnt_before = driver.IFCNT();
 
   driver.toff(5);                        // Enable driver power stage (TOFF = 5)
-  driver.rms_current(current_mA, 1.0f);  // Set RMS current and 100% hold current ratio
-  driver.ihold(31);                      // 31/31 full holding current locked (no read dependency)
-  driver.irun(31);                       // 31/31 full running current locked
-  driver.iholddelay(1);                  // Minimal delay to full hold current
-  driver.pwm_ofs(180);                   // High standstill voltage offset for max holding torque in StealthChop2!
+  driver.rms_current(current_mA, 0.90f); // 900 mA RMS with 90% standstill hold ratio
+  driver.ihold(28);                      // 28/31 (~90%) holding current to prevent motor heating
+  driver.irun(31);                       // 31/31 full running current
+  driver.iholddelay(2);                  // Settle smoothly to standstill current
+  driver.pwm_ofs(160);                   // Optimized standstill voltage offset for cool & quiet holding
   driver.pwm_autoscale(true);            // Automatic current scaling
   driver.pwm_autograd(true);             // Automatic gradient adaptation
   driver.en_spreadCycle(false);          // STRICTLY StealthChop2 enabled for silent operation
@@ -681,7 +756,7 @@ bool setupTMC2209(TMC2209Stepper& driver, const char* name, uint8_t txPin, uint8
 
   Serial.printf("  IFCNT Transmission Writes: %u -> %u (%s)\n", 
                 ifcnt_before, ifcnt_after, (ifcnt_after != ifcnt_before) ? "ACCEPTED" : "NO ACK");
-  Serial.printf("  Holding / Run Current    : %u mA (CS_ACTUAL: %u/31, 100%% Holding Torque Locked)\n", current_mA, cs);
+  Serial.printf("  Holding / Run Current    : %u mA (CS_ACTUAL: %u/31, 0.90A / 90%% Hold Ratio Active)\n", current_mA, cs);
   Serial.printf("  StealthChop2 Silent Mode : %s (pwm_ofs=180 high-torque standstill active)\n", driver.stealth() ? "ACTIVE" : "SpreadCycle");
   Serial.printf("[TMC2209] %s initialization completed.\n\n", name);
 
@@ -705,11 +780,10 @@ FastAccelStepper* setupStepper(uint8_t stepPin, uint8_t dirPin, uint8_t enPin) {
 }
 
 // ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
-// Homing Abort Check Helper (Detects Joystick Override or Link Drop)
+// Homing Abort Check Helper (Detects Deliberate Joystick Override)
 // ---------------------------------------------------------------------------
 bool checkHomingAbort() {
-  if (abs(lastPkt.pan) > JOY_DEAD * 2 || abs(lastPkt.tilt) > JOY_DEAD * 2 || abs(lastPkt.zoom) > JOY_DEAD * 2) {
+  if (abs(lastPkt.pan) > 600 || abs(lastPkt.tilt) > 600) {
     Serial.println("\n[HOMING ABORT] Manual joystick deflection detected! Aborting homing immediately.");
     return true;
   }
@@ -1191,12 +1265,23 @@ bool homeAxesSimultaneous(int32_t tiltLevelOffset) {
 
 // FreeRTOS task for concurrent Zoom Homing (Runs in parallel on Core 0)
 void zoomHomingTask(void* pvParameters) {
+  Serial.printf("[Zoom Homing Task] Started: Driving Wide to physical lens stop (%u ms)...\n", ZOOM_HOMING_TIME_MS);
+  g_irActiveCmd = SONY_IR_CMD_ZOOM_WIDE;
+  g_irActiveUntilMs = millis() + ZOOM_HOMING_TIME_MS;
+
   uint32_t startMs = millis();
-  Serial.println("[Zoom Homing Task] Started: Driving Wide to physical lens stop (5.5s)...");
   while (millis() - startMs < ZOOM_HOMING_TIME_MS) {
-    sendSony15Packet(SONY_IR_ADDR_CAM, SONY_IR_CMD_ZOOM_WIDE);
-    delay(40); // 40ms standard cadence
+    if (checkHomingAbort()) {
+      g_irActiveCmd = 0;
+      g_irActiveUntilMs = 0;
+      vTaskDelete(NULL);
+      return;
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
   }
+
+  g_irActiveCmd = 0;
+  g_irActiveUntilMs = 0;
   currentZoomMs = 0;
   isZoomHomed = true;
   Serial.println("[Zoom Homing Task] Completed! Calibrated at 0.0% Wide (0 ms).");
@@ -1235,7 +1320,7 @@ void homeAll() {
 
   // 3. Wait for concurrent Zoom homing to conclude
   uint32_t waitStart = millis();
-  while (!isZoomHomed && (millis() - waitStart < 7000)) {
+  while (!isZoomHomed && (millis() - waitStart < (ZOOM_HOMING_TIME_MS + 2000))) {
     delay(50);
   }
 
@@ -1280,8 +1365,26 @@ void applyVelocity(FastAccelStepper* st, int16_t cmd, MotorState& ms, int32_t ma
     return;
   }
 
-  int8_t   dir = (cmd > 0) ? 1 : -1;
-  uint32_t spd = map(abs(cmd), JOY_DEAD, 1000, MIN_SPEED_HZ, MAX_SPEED_HZ);
+  int8_t dir = (cmd > 0) ? 1 : -1;
+
+  // Dynamic Zoom-Dependent Speed & Acceleration Scaling:
+  // When at full Wide (0% zoom), scale = 1.0 (full speed: MAX_SPEED_HZ, full accel: ACCEL_HZ_S).
+  // As zoom increases toward Tele (100% zoom), pan & tilt speeds scale down smoothly
+  // so telephoto framing is smooth, stable, and precise rather than twitchy.
+  float zoomFraction = (float)currentZoomMs / (float)ZOOM_FULL_RANGE_MS;
+  if (zoomFraction < 0.0f) zoomFraction = 0.0f;
+  if (zoomFraction > 1.0f) zoomFraction = 1.0f;
+
+  float speedScale = 1.0f - zoomFraction * (1.0f - ZOOM_SPEED_SCALE_MIN);
+  float accelScale = 1.0f - zoomFraction * (1.0f - ZOOM_ACCEL_SCALE_MIN);
+
+  uint32_t effectiveMaxSpeed = (uint32_t)(MAX_SPEED_HZ * speedScale);
+  if (effectiveMaxSpeed < MIN_SPEED_HZ) effectiveMaxSpeed = MIN_SPEED_HZ;
+
+  uint32_t effectiveAccel = (uint32_t)(ACCEL_HZ_S * accelScale);
+  if (effectiveAccel < 3000) effectiveAccel = 3000;
+
+  uint32_t spd = map(abs(cmd), JOY_DEAD, 1000, MIN_SPEED_HZ, effectiveMaxSpeed);
 
   // Soft Limit Check (+/-180 deg from center)
   if (dir > 0 && currentPos >= maxLimitSteps) {
@@ -1304,15 +1407,18 @@ void applyVelocity(FastAccelStepper* st, int16_t cmd, MotorState& ms, int32_t ma
       st->forceStop();
     }
     st->setSpeedInHz(spd);
+    st->setAcceleration(effectiveAccel);
     st->applySpeedAcceleration();
     if (dir > 0) st->runForward();
     else         st->runBackward();
+    ms.dir = dir;
+    ms.spd = spd;
   } else if (spd != ms.spd) {
     st->setSpeedInHz(spd);
+    st->setAcceleration(effectiveAccel);
     st->applySpeedAcceleration();
+    ms.spd = spd;
   }
-  ms.dir = dir;
-  ms.spd = spd;
 }
 
 void stopAllMotors() {
@@ -1332,6 +1438,9 @@ void stopAllMotors() {
   tiltState.dir = 0;
   isMovingToPreset = false;
   currentTargetPreset = 0;
+  targetZoomMs = 0;   // P3: fully clear preset state so next command starts clean
+  g_irActiveCmd = 0;  // Immediately halt any active IR zoom transmission
+  g_irActiveUntilMs = 0;
 }
 
 // Queued asynchronous command flags (processed safely in loop() rather than Wi-Fi ISR)
@@ -1428,6 +1537,10 @@ void setup() {
   // Initialize Sony 40 kHz IR LEDC hardware peripheral
   initIrLedc();
   Serial.printf("IR Transmitter initialized on GPIO %d (40 kHz carrier)\n", PIN_IR_IN);
+
+  // Start the non-blocking IR transmit task (Core 0, priority 1; deterministic 45ms vTaskDelayUntil)
+  xTaskCreatePinnedToCore(irTransmitTask, "IrTxTask", 4096, NULL, 1, NULL, 0);
+  delay(10);
 
   // Load NVS stored presets and center memory
   loadPresetsFromNVS();
@@ -1527,8 +1640,8 @@ void loop() {
       sendMountTelemetry("Remote Control Link Active");
     }
 
-    // Manual joystick overrides preset transition (requires deliberate stick movement > 350)
-    if (isMovingToPreset && (abs(lastPkt.pan) > 350 || abs(lastPkt.tilt) > 350 || abs(lastPkt.zoom) > 350)) {
+    // Manual joystick overrides preset transition (requires deliberate stick movement > 600)
+    if (isMovingToPreset && (abs(lastPkt.pan) > 600 || abs(lastPkt.tilt) > 600)) {
       stopAllMotors();
       Serial.println("[MANUAL OVERRIDE] Preset motion aborted by joystick input.");
       sendMountTelemetry("Preset Move Aborted by Joystick");
@@ -1547,7 +1660,7 @@ void loop() {
 
     bool panBusy = (panStepper && panStepper->isRunning());
     bool tiltBusy = (tiltStepper && tiltStepper->isRunning());
-    bool zoomBusy = (abs((int32_t)targetZoomMs - (int32_t)currentZoomMs) >= 42);
+    bool zoomBusy = (abs((int32_t)targetZoomMs - (int32_t)currentZoomMs) >= ZOOM_TICK_MS);
 
     if (!panBusy && !tiltBusy && !zoomBusy) {
       uint8_t pReached = currentTargetPreset;
@@ -1557,6 +1670,20 @@ void loop() {
       snprintf(evt, sizeof(evt), "Preset %u Reached", pReached);
       sendMountTelemetry(evt);
     }
+  }
+
+  // 2b. Fast zoom telemetry: while the zoom lens is actively moving, report every 100 ms
+  // so the remote's percentage tracks smoothly(no stale 2.5s gaps that caused big jumps..
+  static uint32_t lastFastZoomTelemMs = 0;
+  bool zoomActive = (now - irLastCmdMs < ZOOM_ACTIVE_WINDOW_MS);
+
+  if (zoomActive && (now - lastFastZoomTelemMs >= ZOOM_FAST_TELEMETRY_MS)) {
+
+
+
+    lastFastZoomTelemMs = now;
+
+    sendMountTelemetry();
   }
 
   // 3. Failsafe: Link loss timeout watchdog -> halt motion & clear all preset state

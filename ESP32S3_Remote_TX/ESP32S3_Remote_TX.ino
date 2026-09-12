@@ -12,25 +12,25 @@
  *   - Battery & Power Sensing:
  *       PIN_BATT_ADC  : GPIO 1 (100k/100k divider, calibration factor 2.23f)
  *       PIN_USB_SENSE : GPIO 2 (USB 5V presence detection ADC)
- *   - Left Joystick (Pan / Tilt):
- *       VRx (Pan)     : GPIO 4 (ADC1_CH3)
- *       VRy (Tilt)    : GPIO 5 (ADC1_CH4)
- *       Click (SW)    : GPIO 15 (INPUT_PULLUP)
- *   - Right Joystick (Zoom & Aux):
- *       VRx (Aux)     : GPIO 6 (ADC1_CH5)
- *       VRy (Zoom)    : GPIO 7 (ADC1_CH6: Forward=Tele/In, Back=Wide/Out)
- *       Click (SW)    : GPIO 16 (INPUT_PULLUP)
- *   - Rotary Encoder (HW-787AB Quadrature):
+ *   - Joystick Controls:
+ *       Left Stick VRx (Pan)  : GPIO 4 (ADC1_CH3) -> PAN (Left = CCW, Right = CW)
+ *       Left Stick VRy (Aux)  : GPIO 5 (ADC1_CH4) -> AUX / Reserved
+ *       Left Stick Click (SW) : GPIO 15 (INPUT_PULLUP)
+ *       Right Stick VRx (Aux) : GPIO 6 (ADC1_CH5) -> AUX / Reserved
+ *       Right Stick VRy (Tilt): GPIO 7 (ADC1_CH6) -> TILT (Up = Up, Down = Down)
+ *       Right Stick Click (SW): GPIO 16 (INPUT_PULLUP)
+ *   - Pushbutton Controls (Auto-Calibrated Resting Baseline):
+ *       Color Button 1: GPIO 38 -> Zoom In / Tele (Held: +1000)
+ *       Color Button 2: GPIO 39 -> Zoom Out / Wide (Held: -1000)
+ *       Color Button 3: GPIO 40 -> Quick Recall Preset 1
+ *       Color Button 4: GPIO 41 -> Quick Recall Preset 2
+ *       Color Button 5: GPIO 42 -> Quick Recall Preset 3
+ *   - Rotary Encoder (HW-787AB Quadrature) & Navigation:
  *       Phase A (TRA) : GPIO 10 (Interrupt, any edge)
  *       Phase B (TRB) : GPIO 11 (Interrupt, any edge)
- *       Push (PSH)    : GPIO 12 (INPUT_PULLUP) -> Menu Select / Open
- *   - Menu & Navigation Pushbuttons:
- *       Confirm (CON) : GPIO 13 (INPUT_PULLUP) -> Toggle Main UI / Mount Diag
- *       Back (BAK)    : GPIO 17 (INPUT_PULLUP) -> Return to Main UI
- *   - 5 Color Preset Pushbuttons:
- *       Color 1..5    : GPIO 38, 39, 40, 41, 42 (INPUT_PULLUP)
- *                       Short Click: Recall Preset 1..5
- *                       Long Press (>1.5s): Save Preset 1..5
+ *       Push (PSH)    : GPIO 12 -> Menu Select / Confirm
+ *       Confirm (CON) : GPIO 13 -> Menu Select / Confirm / Open Menu
+ *       Back (BAK)    : GPIO 17 -> Back / Cancel / Delete Character
  *
  * Required Libraries (Arduino Library Manager):
  *   - Adafruit SH110X (by Adafruit)
@@ -64,11 +64,11 @@ struct MountTelemetryPacket;
 #define PIN_USB_SENSE     2   // USB 5V presence sense (ADC)
 
 #define PIN_LJOY_X        4   // Left joystick VRx  -> PAN
-#define PIN_LJOY_Y        5   // Left joystick VRy  -> TILT
+#define PIN_LJOY_Y        5   // Left joystick VRy  -> AUX / Reserved
 #define PIN_LJOY_SW      15   // Left joystick click (active LOW)
 
-#define PIN_RJOY_X        6   // Right joystick VRx -> AUX
-#define PIN_RJOY_Y        7   // Right joystick VRy -> ZOOM (Forward=Tele, Back=Wide)
+#define PIN_RJOY_X        6   // Right joystick VRx -> AUX / Reserved
+#define PIN_RJOY_Y        7   // Right joystick VRy -> TILT
 #define PIN_RJOY_SW      16   // Right joystick click (active LOW)
 
 #define PIN_I2C_SDA       8   // OLED I2C SDA
@@ -76,11 +76,12 @@ struct MountTelemetryPacket;
 
 #define PIN_ENC_A        10   // HW-787AB encoder phase A (TRA)
 #define PIN_ENC_B        11   // HW-787AB encoder phase B (TRB)
-#define PIN_ENC_BTN      12   // Encoder push (PSH, active LOW) -> menu open/select
-#define PIN_BTN_CON      13   // Confirm button (active LOW) -> toggle mount diag
-#define PIN_BTN_BAK      17   // Back button    (active LOW) -> return to main
+#define PIN_ENC_BTN      12   // Encoder push (PSH, active LOW) -> Confirm / Select
+#define PIN_BTN_CON      13   // Confirm button (active LOW) -> Confirm / Select
+#define PIN_BTN_BAK      17   // Back button    (active LOW) -> Back / Delete / Exit
 
-// 5 Color preset action buttons (active LOW)
+// 5 Color pushbuttons
+// Btn 1: Zoom In, Btn 2: Zoom Out, Btn 3..5: Quick Recall Presets 1..3
 static const uint8_t PIN_COLOR_BTNS[5] = {38, 39, 40, 41, 42};
 
 // ---------------------------------------------------------------------------
@@ -117,12 +118,15 @@ const int   USB_SENSE_THRESHOLD     = 1000;   // raw ADC threshold for 5V USB
 #define PKT_START_HOMING  0x06
 #define PKT_TELEMETRY     0x07
 
+// Keep in sync with the mount receiver's ZOOM_FULL_RANGE_MS: full optical zoom travel (0 ms = Wide)
+#define ZOOM_FULL_RANGE_MS  13000
+
 struct __attribute__((packed)) PtzPacket {
   uint8_t  type;                  // PKT_*
   uint8_t  mac[6];                // sender MAC (pairing handshake)
   int16_t  pan;                   // -1000..+1000 velocity command
   int16_t  tilt;                  // -1000..+1000 velocity command
-  int16_t  zoom;                  // -1000..+1000 zoom command (Right Stick Y: + Tele, - Wide)
+  int16_t  zoom;                  // -1000..+1000 zoom command (+ Tele/In, - Wide/Out)
   int16_t  auxX;                  // right stick X (reserved)
   uint16_t buttons;               // BTNBIT_* bitfield
   uint8_t  presetId;              // Preset slot (1..8) for SAVE/GOTO
@@ -144,7 +148,7 @@ struct __attribute__((packed)) MountTelemetryPacket {
   int32_t  tiltSteps;             // Current tilt position in steps
   float    panDeg;                // Calculated pan angle in degrees (-180.0 .. +180.0)
   float    tiltDeg;               // Calculated tilt angle in degrees (-90.0 .. +90.0)
-  uint16_t zoomMs;                // Current zoom dead-reckoning position (0..3500 ms)
+  uint16_t zoomMs;                // Current zoom dead-reckoning position (0..ZOOM_FULL_RANGE_MS)
   uint8_t  zoomPct;               // Zoom percentage (0..100%)
   uint8_t  isHomed;               // 1 if homing complete
   uint8_t  state;                 // 0=IDLE, 1=LIVE_MOVING, 2=HOMING, 3=GOTO_PRESET
@@ -167,16 +171,24 @@ enum ButtonBits : uint16_t {
 };
 
 // ---------------------------------------------------------------------------
-// UI & Menu Model
-// ---------------------------------------------------------------------------
 // UI & Menu Model (Professional Remote OS)
 // ---------------------------------------------------------------------------
-enum UiMode   : uint8_t { UI_LIVE = 0, UI_PRESETS = 1, UI_LOGS = 2, UI_DIAG = 3, UI_MENU = 4 };
+enum UiMode : uint8_t {
+  UI_LIVE = 0,
+  UI_MENU,
+  UI_PRESETS_LIST,
+  UI_PRESET_ACTION,
+  UI_NAME_EDITOR,
+  UI_HOMING,
+  UI_LOGS,
+  UI_DIAG
+};
+
 enum MenuItem : uint8_t {
   MI_PRESETS = 0,
-  MI_LOGS,
-  MI_DIAG,
   MI_HOME,
+  MI_DIAG,
+  MI_LOGS,
   MI_BRIGHT,
   MI_SENS,
   MI_INV_PAN,
@@ -186,23 +198,56 @@ enum MenuItem : uint8_t {
 };
 
 const char* MENU_NAMES[MI_COUNT] = {
-  "Preset Hub", "System Logs", "Mount Diag", "Home Mount",
+  "Preset Hub", "Home Mount", "Mount Diag", "System Logs",
   "Brightness", "Sensitivity", "Invert Pan", "Invert Tilt", "Exit Menu"
 };
 
+enum PresetActionItem : uint8_t {
+  PACT_GOTO = 0,
+  PACT_SAVE,
+  PACT_RENAME,
+  PACT_BACK,
+  PACT_COUNT
+};
+
+const char* PRESET_ACTION_NAMES[PACT_COUNT] = {
+  "Goto Position", "Save Current Framing", "Rename Preset", "Back"
+};
+
 // ---------------------------------------------------------------------------
-// Remote Preset Cache & OS Notification Banners
+// Remote Preset Cache & Custom Naming (Upper & Lower Case Support)
 // ---------------------------------------------------------------------------
 struct PresetSummary {
   bool    valid;
+  char    name[12];
   float   panDeg;
   float   tiltDeg;
   uint8_t zoomPct;
 };
-PresetSummary remotePresets[8] = {};
-uint8_t activePresetSlot  = 1; // Currently selected active slot (1..8)
-uint8_t presetHubSelected = 1; // Highlighted slot inside Preset Hub (1..8)
 
+static const char* DEFAULT_PRESET_NAMES[8] = {
+  "Pulpit", "Piano", "Choir", "Wide Stage",
+  "Preset 5", "Preset 6", "Preset 7", "Preset 8"
+};
+
+PresetSummary remotePresets[8] = {};
+uint8_t activePresetSlot   = 1; // Currently selected active slot (1..8)
+uint8_t presetListSelected = 0; // Highlighted slot index in list (0..7)
+uint8_t presetActSelected  = 0; // Highlighted action in Preset Action (0..3)
+
+// Name Editor State
+char    editNameBuffer[12] = "";
+uint8_t editNameSlotIdx    = 0;
+int16_t editCharIdx        = 0;
+
+// Character set ribbon with UPPERCASE, LOWERCASE, numbers, symbols, DEL, and OK
+static const char CHAR_SET[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 -_#&./";
+#define CHAR_SET_LEN ((int16_t)(sizeof(CHAR_SET) - 1))
+#define CHAR_CODE_DEL  (CHAR_SET_LEN)
+#define CHAR_CODE_SAVE (CHAR_SET_LEN + 1)
+#define TOTAL_EDITOR_SYMBOLS (CHAR_SET_LEN + 2)
+
+// Banner Notifications
 char     bannerText[28]  = "";
 uint32_t bannerExpireMs  = 0;
 
@@ -236,7 +281,7 @@ void addLog(const char* msg) {
 // ESP-NOW Link State
 // ---------------------------------------------------------------------------
 #define TX_INTERVAL_MS    20      // 50 Hz control stream
-#define LINK_FAIL_LIMIT   100     // consecutive TX failures -> re-scan (~2s)
+#define LINK_FAIL_LIMIT   250     // ~5s consecutive TX failures before re-scanning
 
 enum LinkState : uint8_t { LINK_SCAN = 0, LINK_PAIRED };
 
@@ -259,6 +304,7 @@ MountTelemetryPacket latestMountTelem = {};
 bool     hasMountTelem        = false;
 uint32_t lastMountTelemMs     = 0;
 char     lastLoggedEvent[32]  = "";
+uint8_t  lastMountState       = 0;
 
 // ---------------------------------------------------------------------------
 // Persistent Settings (NVS)
@@ -280,12 +326,31 @@ void loadRemotePresets() {
     char k[16];
     snprintf(k, sizeof(k), "p%u_v", i);
     remotePresets[i].valid = prefs.getBool(k, false);
+
+    snprintf(k, sizeof(k), "p%u_name", i);
+    String sName = prefs.getString(k, DEFAULT_PRESET_NAMES[i]);
+    if (sName.length() == 0) sName = DEFAULT_PRESET_NAMES[i];
+    strncpy(remotePresets[i].name, sName.c_str(), sizeof(remotePresets[i].name) - 1);
+    remotePresets[i].name[sizeof(remotePresets[i].name) - 1] = '\0';
+
     if (remotePresets[i].valid) {
       snprintf(k, sizeof(k), "p%u_p", i); remotePresets[i].panDeg = prefs.getFloat(k, 0.0f);
       snprintf(k, sizeof(k), "p%u_t", i); remotePresets[i].tiltDeg = prefs.getFloat(k, 0.0f);
       snprintf(k, sizeof(k), "p%u_z", i); remotePresets[i].zoomPct = prefs.getUChar(k, 0);
     }
   }
+  prefs.end();
+}
+
+void savePresetToNVS(uint8_t idx) {
+  if (idx >= 8) return;
+  prefs.begin("rem_p", false);
+  char k[16];
+  snprintf(k, sizeof(k), "p%u_v", idx);    prefs.putBool(k, remotePresets[idx].valid);
+  snprintf(k, sizeof(k), "p%u_name", idx); prefs.putString(k, String(remotePresets[idx].name));
+  snprintf(k, sizeof(k), "p%u_p", idx);    prefs.putFloat(k, remotePresets[idx].panDeg);
+  snprintf(k, sizeof(k), "p%u_t", idx);    prefs.putFloat(k, remotePresets[idx].tiltDeg);
+  snprintf(k, sizeof(k), "p%u_z", idx);    prefs.putUChar(k, remotePresets[idx].zoomPct);
   prefs.end();
 }
 
@@ -412,39 +477,74 @@ int encoderDetents() {
 }
 
 // ---------------------------------------------------------------------------
-// Button Debounce with Long-Press Detection
+// Universal Auto-Calibrating Button Engine
 // ---------------------------------------------------------------------------
+// Auto-samples resting voltage levels at boot to support Active-LOW, Active-HIGH,
+// Normally Closed switches, and pins with onboard pulldowns (e.g. WS2812 DIN).
 struct Button {
   uint8_t  pin;
-  bool     stable;
+  bool     restingState;  // Sampled at boot (unpressed level)
+  bool     stable;        // true = pressed, false = unpressed
   bool     lastRaw;
+  bool     wasPressed;    // One-shot click event
   uint32_t lastChangeMs;
   uint32_t pressStartMs;
   bool     longPressHandled;
 };
 
 void buttonInit(Button &b, uint8_t pin) {
-  b.pin = pin; b.stable = false; b.lastRaw = false;
-  b.lastChangeMs = 0; b.pressStartMs = 0; b.longPressHandled = false;
+  b.pin = pin;
   pinMode(pin, INPUT_PULLUP);
+  b.restingState = digitalRead(pin); // Initial baseline sample
+  b.stable = false;
+  b.lastRaw = false;
+  b.wasPressed = false;
+  b.lastChangeMs = 0;
+  b.pressStartMs = 0;
+  b.longPressHandled = false;
 }
 
-bool buttonPressed(Button &b) {
-  bool raw = (digitalRead(b.pin) == LOW);
+Button btnLJoy, btnRJoy, btnEnc, btnCon, btnBak, btnColor[5];
+
+void calibrateButtonRestingState() {
+  delay(60); // Allow all external wiring and pull-ups to fully settle
+  btnLJoy.restingState = digitalRead(btnLJoy.pin);
+  btnRJoy.restingState = digitalRead(btnRJoy.pin);
+  btnEnc.restingState  = digitalRead(btnEnc.pin);
+  btnCon.restingState  = digitalRead(btnCon.pin);
+  btnBak.restingState  = digitalRead(btnBak.pin);
+  for (uint8_t i = 0; i < 5; i++) {
+    btnColor[i].restingState = digitalRead(btnColor[i].pin);
+  }
+}
+
+void buttonUpdate(Button &b) {
+  // Raw is TRUE whenever the pin differs from its resting state (user is pressing the button)
+  bool raw = (digitalRead(b.pin) != b.restingState);
   uint32_t now = millis();
-  if (raw != b.lastRaw) { b.lastRaw = raw; b.lastChangeMs = now; }
-  if ((now - b.lastChangeMs) > 25 && raw != b.stable) {
+  if (raw != b.lastRaw) {
+    b.lastRaw = raw;
+    b.lastChangeMs = now;
+  }
+  if ((now - b.lastChangeMs) > 20 && raw != b.stable) {
     b.stable = raw;
     if (b.stable) {
       b.pressStartMs = now;
       b.longPressHandled = false;
-      return true;
+      b.wasPressed = true;
     }
+  }
+}
+
+bool buttonPressed(Button &b) {
+  if (b.wasPressed) {
+    b.wasPressed = false;
+    return true;
   }
   return false;
 }
 
-bool buttonLongPressed(Button &b, uint32_t holdMs = 1500) {
+bool buttonLongPressed(Button &b, uint32_t holdMs = 1200) {
   if (b.stable && !b.longPressHandled && (millis() - b.pressStartMs >= holdMs)) {
     b.longPressHandled = true;
     return true;
@@ -452,17 +552,26 @@ bool buttonLongPressed(Button &b, uint32_t holdMs = 1500) {
   return false;
 }
 
-Button btnLJoy, btnRJoy, btnEnc, btnCon, btnBak, btnColor[5];
+void updateAllButtons() {
+  buttonUpdate(btnLJoy);
+  buttonUpdate(btnRJoy);
+  buttonUpdate(btnEnc);
+  buttonUpdate(btnCon);
+  buttonUpdate(btnBak);
+  for (uint8_t i = 0; i < 5; i++) {
+    buttonUpdate(btnColor[i]);
+  }
+}
 
 uint16_t buildButtonBits() {
   uint16_t b = 0;
-  if (digitalRead(PIN_LJOY_SW)  == LOW) b |= BTNBIT_LJOY;
-  if (digitalRead(PIN_RJOY_SW)  == LOW) b |= BTNBIT_RJOY;
-  if (digitalRead(PIN_ENC_BTN)  == LOW) b |= BTNBIT_PSH;
-  if (digitalRead(PIN_BTN_CON)  == LOW) b |= BTNBIT_CON;
-  if (digitalRead(PIN_BTN_BAK)  == LOW) b |= BTNBIT_BAK;
+  if (btnLJoy.stable) b |= BTNBIT_LJOY;
+  if (btnRJoy.stable) b |= BTNBIT_RJOY;
+  if (btnEnc.stable)  b |= BTNBIT_PSH;
+  if (btnCon.stable)  b |= BTNBIT_CON;
+  if (btnBak.stable)  b |= BTNBIT_BAK;
   for (uint8_t i = 0; i < 5; i++)
-    if (digitalRead(PIN_COLOR_BTNS[i]) == LOW) b |= (BTNBIT_C1 << i);
+    if (btnColor[i].stable) b |= (BTNBIT_C1 << i);
   if (settings.zoomSlowMode) b |= BTNBIT_ZOOM_SLOW;
   return b;
 }
@@ -608,20 +717,14 @@ void commandSavePreset(uint8_t id) {
   remotePresets[idx].tiltDeg = latestMountTelem.tiltDeg;
   remotePresets[idx].zoomPct = latestMountTelem.zoomPct;
 
-  prefs.begin("rem_p", false);
-  char k[16];
-  snprintf(k, sizeof(k), "p%u_v", idx); prefs.putBool(k, true);
-  snprintf(k, sizeof(k), "p%u_p", idx); prefs.putFloat(k, remotePresets[idx].panDeg);
-  snprintf(k, sizeof(k), "p%u_t", idx); prefs.putFloat(k, remotePresets[idx].tiltDeg);
-  snprintf(k, sizeof(k), "p%u_z", idx); prefs.putUChar(k, remotePresets[idx].zoomPct);
-  prefs.end();
+  savePresetToNVS(idx);
 
   char b[28];
-  snprintf(b, sizeof(b), "P%u SAVED!", id);
+  snprintf(b, sizeof(b), "SAVED [%s]!", remotePresets[idx].name);
   showBanner(b, 2500);
   addLog(b);
   activePresetSlot = id;
-  Serial.printf("\n>>> [PRESET] Saved Preset %u to Mount & Remote! <<<\n\n", id);
+  Serial.printf("\n>>> [PRESET] Saved Preset %u [%s] to Mount & Remote! <<<\n\n", id, remotePresets[idx].name);
 }
 
 void commandGotoPreset(uint8_t id) {
@@ -632,13 +735,19 @@ void commandGotoPreset(uint8_t id) {
   WiFi.macAddress(pkt.mac);
   esp_now_send(mountMac, (uint8_t*)&pkt, sizeof(pkt));
 
+  uint8_t idx = id - 1;
   char b[28];
-  snprintf(b, sizeof(b), "RECALLING P%u...", id);
+  snprintf(b, sizeof(b), "RECALL [%s]...", remotePresets[idx].name);
   showBanner(b, 2500);
   addLog(b);
   activePresetSlot = id;
-  Serial.printf("\n>>> [RECALL] Sent GOTO Preset %u to Mount! <<<\n\n", id);
+  Serial.printf("\n>>> [RECALL] Sent GOTO Preset %u [%s] to Mount! <<<\n\n", id, remotePresets[idx].name);
 }
+
+// Fullscreen Homing Execution
+UiMode   uiMode      = UI_LIVE;
+MenuItem menuSel     = MI_PRESETS;
+bool     menuEditing = false;
 
 void commandStartHoming() {
   PtzPacket pkt = {};
@@ -647,6 +756,7 @@ void commandStartHoming() {
   esp_now_send(mountMac, (uint8_t*)&pkt, sizeof(pkt));
   Serial.println("\n>>> [HOMING] Sent START HOMING command to Mount! <<<\n");
 
+  uiMode = UI_HOMING;
   showBanner("HOMING MOUNT...", 4000);
   addLog("Homing Mount...");
 }
@@ -654,86 +764,42 @@ void commandStartHoming() {
 // ---------------------------------------------------------------------------
 // Settings Menu & UI Navigation
 // ---------------------------------------------------------------------------
-UiMode   uiMode      = UI_LIVE;
-MenuItem menuSel     = MI_PRESETS;
-bool     menuEditing = false;
-
 void handleMenuInput(int detents) {
   bool pshPress = buttonPressed(btnEnc);
-  bool pshHold  = buttonLongPressed(btnEnc, 1200);
-  bool bakPress = buttonPressed(btnBak);
   bool conPress = buttonPressed(btnCon);
+  bool bakPress = buttonPressed(btnBak);
+  bool actSelect = pshPress || conPress; // Both Confirm and Encoder Push act as Select / Confirm
 
-  // CON button: Toggle Preset Hub from anywhere
-  if (conPress) {
-    if (uiMode == UI_PRESETS) {
+  // Auto-manage Homing UI State: if Mount enters state 2 (HOMING), switch to UI_HOMING
+  if (latestMountTelem.state == 2) {
+    uiMode = UI_HOMING;
+  } else if (uiMode == UI_HOMING && latestMountTelem.state != 2 && lastMountState == 2) {
+    // Finished homing
+    uiMode = UI_LIVE;
+    showBanner("HOMING COMPLETE!", 3000);
+    addLog("Homing Complete");
+  }
+  lastMountState = latestMountTelem.state;
+
+  // 1. Fullscreen Homing Screen
+  if (uiMode == UI_HOMING) {
+    if (bakPress) {
+      // Allow user to manually exit homing screen if desired
       uiMode = UI_LIVE;
-    } else {
-      uiMode = UI_PRESETS;
-      presetHubSelected = activePresetSlot;
     }
     return;
   }
 
-  // Live Screen
+  // 2. Live Screen
   if (uiMode == UI_LIVE) {
-    if (pshPress) {
+    if (actSelect) {
       uiMode = UI_MENU;
       menuEditing = false;
     }
     return;
   }
 
-  // Preset Hub Screen
-  if (uiMode == UI_PRESETS) {
-    if (bakPress) {
-      uiMode = UI_LIVE;
-      return;
-    }
-    // Long press encoder (>1.2s) to save current framing into selected slot
-    if (pshHold) {
-      commandSavePreset(presetHubSelected);
-      return;
-    }
-    // Click encoder to recall selected slot
-    if (pshPress) {
-      commandGotoPreset(presetHubSelected);
-      uiMode = UI_LIVE;
-      return;
-    }
-    // Encoder scroll through slots 1..8
-    if (detents != 0) {
-      int s = (int)presetHubSelected + detents;
-      while (s < 1) s += 8;
-      while (s > 8) s -= 8;
-      presetHubSelected = (uint8_t)s;
-    }
-    return;
-  }
-
-  // System Logs Screen (Scrollable Console)
-  if (uiMode == UI_LOGS) {
-    if (bakPress || pshPress) {
-      uiMode = UI_MENU;
-      return;
-    }
-    if (detents != 0) {
-      int maxScroll = (logTotal > 5) ? (logTotal - 5) : 0;
-      logScroll = constrain(logScroll - detents, 0, maxScroll);
-    }
-    return;
-  }
-
-  // Mount Diag Screen
-  if (uiMode == UI_DIAG) {
-    if (bakPress || pshPress) {
-      uiMode = UI_MENU;
-      return;
-    }
-    return;
-  }
-
-  // Settings Menu
+  // 3. Main Menu
   if (uiMode == UI_MENU) {
     if (bakPress) {
       if (menuEditing) {
@@ -745,26 +811,24 @@ void handleMenuInput(int detents) {
       return;
     }
 
-    if (pshPress) {
+    if (actSelect) {
       if (menuEditing) {
         menuEditing = false;
         saveSettings();
       } else {
         switch (menuSel) {
           case MI_PRESETS:
-            uiMode = UI_PRESETS;
-            presetHubSelected = activePresetSlot;
+            uiMode = UI_PRESETS_LIST;
             break;
-          case MI_LOGS:
-            uiMode = UI_LOGS;
-            logScroll = 0;
+          case MI_HOME:
+            commandStartHoming();
             break;
           case MI_DIAG:
             uiMode = UI_DIAG;
             break;
-          case MI_HOME:
-            commandStartHoming();
-            uiMode = UI_LIVE;
+          case MI_LOGS:
+            uiMode = UI_LOGS;
+            logScroll = 0;
             break;
           case MI_INV_PAN:
             settings.invertPan = !settings.invertPan;
@@ -797,6 +861,139 @@ void handleMenuInput(int detents) {
     } else if (menuSel == MI_SENS) {
       settings.sensitivity = constrain(settings.sensitivity + detents * 0.1f, 0.2f, 3.0f);
     }
+    return;
+  }
+
+  // 4. Presets List Screen (Select 1 of 8 Presets)
+  if (uiMode == UI_PRESETS_LIST) {
+    if (bakPress) {
+      uiMode = UI_MENU;
+      return;
+    }
+    if (actSelect) {
+      uiMode = UI_PRESET_ACTION;
+      presetActSelected = 0;
+      return;
+    }
+    if (detents != 0) {
+      int s = (int)presetListSelected + detents;
+      while (s < 0) s += 8;
+      presetListSelected = (uint8_t)(s % 8);
+    }
+    return;
+  }
+
+  // 5. Preset Action Screen (Goto, Save, Rename, Back)
+  if (uiMode == UI_PRESET_ACTION) {
+    if (bakPress) {
+      uiMode = UI_PRESETS_LIST;
+      return;
+    }
+    if (actSelect) {
+      uint8_t slot = presetListSelected + 1;
+      switch ((PresetActionItem)presetActSelected) {
+        case PACT_GOTO:
+          commandGotoPreset(slot);
+          uiMode = UI_LIVE;
+          break;
+        case PACT_SAVE:
+          commandSavePreset(slot);
+          uiMode = UI_LIVE;
+          break;
+        case PACT_RENAME:
+          editNameSlotIdx = presetListSelected;
+          strncpy(editNameBuffer, remotePresets[editNameSlotIdx].name, sizeof(editNameBuffer) - 1);
+          editNameBuffer[sizeof(editNameBuffer) - 1] = '\0';
+          editCharIdx = 0;
+          uiMode = UI_NAME_EDITOR;
+          break;
+        case PACT_BACK:
+        default:
+          uiMode = UI_PRESETS_LIST;
+          break;
+      }
+      return;
+    }
+    if (detents != 0) {
+      int s = (int)presetActSelected + detents;
+      while (s < 0) s += PACT_COUNT;
+      presetActSelected = (uint8_t)(s % PACT_COUNT);
+    }
+    return;
+  }
+
+  // 6. Character Wheel Name Editor
+  if (uiMode == UI_NAME_EDITOR) {
+    if (bakPress) {
+      // Back button acts as backspace / delete last character
+      size_t len = strlen(editNameBuffer);
+      if (len > 0) {
+        editNameBuffer[len - 1] = '\0';
+      } else {
+        // If empty, exit editor
+        uiMode = UI_PRESET_ACTION;
+      }
+      return;
+    }
+
+    if (actSelect) {
+      if (editCharIdx == CHAR_CODE_DEL) {
+        // Backspace action
+        size_t len = strlen(editNameBuffer);
+        if (len > 0) editNameBuffer[len - 1] = '\0';
+      } else if (editCharIdx == CHAR_CODE_SAVE) {
+        // Save & Finish
+        if (strlen(editNameBuffer) == 0) {
+          strncpy(editNameBuffer, DEFAULT_PRESET_NAMES[editNameSlotIdx], sizeof(editNameBuffer) - 1);
+        }
+        strncpy(remotePresets[editNameSlotIdx].name, editNameBuffer, sizeof(remotePresets[editNameSlotIdx].name) - 1);
+        remotePresets[editNameSlotIdx].name[sizeof(remotePresets[editNameSlotIdx].name) - 1] = '\0';
+        savePresetToNVS(editNameSlotIdx);
+
+        char b[28];
+        snprintf(b, sizeof(b), "RENAMED TO [%s]", editNameBuffer);
+        showBanner(b, 2500);
+        addLog(b);
+        uiMode = UI_PRESET_ACTION;
+      } else if (editCharIdx < CHAR_SET_LEN) {
+        // Append selected character
+        size_t len = strlen(editNameBuffer);
+        if (len < sizeof(editNameBuffer) - 1) {
+          editNameBuffer[len] = CHAR_SET[editCharIdx];
+          editNameBuffer[len + 1] = '\0';
+        }
+      }
+      return;
+    }
+
+    if (detents != 0) {
+      int s = (int)editCharIdx + detents;
+      while (s < 0) s += TOTAL_EDITOR_SYMBOLS;
+      editCharIdx = (int16_t)(s % TOTAL_EDITOR_SYMBOLS);
+    }
+    return;
+  }
+
+  // 7. System Logs Screen (Scrollable Console)
+  if (uiMode == UI_LOGS) {
+    if (bakPress || actSelect) {
+      uiMode = UI_MENU;
+      return;
+    }
+    if (detents != 0) {
+      int maxScroll = (logTotal > 5) ? (logTotal - 5) : 0;
+      logScroll = constrain(logScroll - detents, 0, maxScroll);
+    }
+    return;
+  }
+
+  // 8. Mount Diag Screen
+  if (uiMode == UI_DIAG) {
+    if (bakPress || actSelect) {
+      uiMode = UI_MENU;
+      return;
+    }
+    return;
   }
 }
 
@@ -816,7 +1013,6 @@ void menuValueStr(MenuItem item, char* buf, size_t n) {
 // Fullscreen Animated Radar / Satellite Search Screen when unlinked
 void drawSearchingScreen() {
   uint32_t now = millis();
-  display.clearDisplay();
 
   int16_t cx = 64;
   int16_t cy = 22;
@@ -859,6 +1055,7 @@ void drawSearchingScreen() {
   display.print(sub);
 }
 
+// Clean Status Bar: Battery | Active Preset Name Badge | Link Status
 void drawStatusBar() {
   float volts = filteredBatteryVoltage();
   int   pct   = batteryPercent(volts);
@@ -866,101 +1063,169 @@ void drawStatusBar() {
 
   display.setTextSize(1);
 
+  // 1. Left: Battery Gauge or Charge ETA (X: 1..32)
   if (usb) {
-    // Lightning bolt icon + charge ETA
-    display.fillTriangle(2, 0, 7, 0, 4, 5, SH110X_WHITE);
-    display.fillTriangle(4, 4, 8, 4, 3, 10, SH110X_WHITE);
+    display.fillTriangle(1, 0, 5, 0, 3, 4, SH110X_WHITE);
+    display.fillTriangle(3, 4, 7, 4, 2, 9, SH110X_WHITE);
     display.setTextColor(SH110X_WHITE);
-    display.setCursor(11, 1);
-    display.printf("ETA:%um", chargeEtaMinutes(pct));
+    display.setCursor(9, 1);
+    display.printf("%dm", chargeEtaMinutes(pct));
   } else {
-    // Battery gauge outline + filled proportional bars
-    display.drawRect(0, 1, 15, 8, SH110X_WHITE);
-    display.fillRect(15, 3, 2, 4, SH110X_WHITE);
-    int fillW = (13 * pct) / 100;
+    display.drawRect(0, 1, 13, 8, SH110X_WHITE);
+    display.fillRect(13, 3, 2, 4, SH110X_WHITE);
+    int fillW = (11 * pct) / 100;
     if (fillW > 0) display.fillRect(1, 2, fillW, 6, SH110X_WHITE);
     display.setTextColor(SH110X_WHITE);
-    display.setCursor(19, 1);
+    display.setCursor(17, 1);
     display.printf("%d%%", pct);
   }
 
-  // Active Preset badge in center of status bar
+  // 2. Center: Active Preset Name Badge
   display.setTextColor(SH110X_WHITE);
-  display.setCursor(42, 1);
-  display.printf("[PRESET %u]", activePresetSlot);
+  uint8_t activeIdx = activePresetSlot - 1;
+  const char* activeName = (activeIdx < 8 && strlen(remotePresets[activeIdx].name) > 0)
+                           ? remotePresets[activeIdx].name : DEFAULT_PRESET_NAMES[activeIdx];
+  char badge[16];
+  snprintf(badge, sizeof(badge), "[%.8s]", activeName);
+  int16_t badgeW = strlen(badge) * 6;
+  int16_t badgeX = (SCREEN_WIDTH - badgeW) / 2;
+  display.setCursor(badgeX, 1);
+  display.print(badge);
 
-  // Link status
+  // 3. Right: Clean Link Status Badge (X: 92..126)
   display.setCursor(92, 1);
-  if (linkState == LINK_PAIRED) display.printf("LK:C%u", mountChannel);
-  else                          display.printf("SCN%u", scanChannel);
+  if (linkState == LINK_PAIRED) {
+    display.print("[LINK]");
+  } else {
+    display.print("[SCAN]");
+  }
 
   display.drawFastHLine(0, STATUS_BAR_H, SCREEN_WIDTH, SH110X_WHITE);
 }
 
-void drawDial(int16_t cx, int16_t cy, int16_t r, float x, float y, const char* label) {
+void drawDial(int16_t cx, int16_t cy, int16_t r, float val, bool isVertical, const char* label) {
   display.drawCircle(cx, cy, r, SH110X_WHITE);
   display.drawFastHLine(cx - r + 2, cy, 2 * r - 3, SH110X_WHITE);
   display.drawFastVLine(cx, cy - r + 2, 2 * r - 3, SH110X_WHITE);
-  int16_t dx = cx + (int16_t)(x * (r - 4));
-  int16_t dy = cy + (int16_t)(y * (r - 4));
+
+  int16_t dx = cx;
+  int16_t dy = cy;
+  if (isVertical) {
+    dy = cy - (int16_t)(val * (r - 4));
+  } else {
+    dx = cx + (int16_t)(val * (r - 4));
+  }
   display.fillCircle(dx, dy, 2, SH110X_WHITE);
+
   int16_t tx = cx - (int16_t)(strlen(label) * 3);
   display.setTextColor(SH110X_WHITE);
   display.setCursor(tx, cy + r + 2);
   display.print(label);
 }
 
-void drawMainUi(int16_t pan, int16_t tilt, int16_t zoom, int16_t auxX) {
-  // Left Dial: Pan / Tilt
-  drawDial(26, 31, 12, pan / 1000.0f, tilt / 1000.0f, "PAN/TILT");
+void drawMainUi(int16_t pan, int16_t tilt, int16_t zoom) {
+  // Left Dial: Pan (VRx on Left Joystick)
+  drawDial(22, 31, 11, pan / 1000.0f, false, "PAN");
 
-  // Center live readouts
+  // Center live telemetry readouts & Zoom state
   display.setTextSize(1);
   display.setTextColor(SH110X_WHITE);
-  display.setCursor(44, 18);
+  display.setCursor(41, 16);
   display.printf("P:%+4.0f\xF7", latestMountTelem.panDeg);
-  display.setCursor(44, 28);
+  display.setCursor(41, 26);
   display.printf("T:%+4.0f\xF7", latestMountTelem.tiltDeg);
-  display.setCursor(44, 38);
+  display.setCursor(41, 36);
   display.printf("Z:%3u%%", latestMountTelem.zoomPct);
 
-  // Right Dial: Zoom (Y-axis: Up=Tele, Down=Wide) / Aux
-  drawDial(102, 31, 12, auxX / 1000.0f, -zoom / 1000.0f, "ZOOM/AUX");
+  // Zoom In / Out Active Indicator Badge
+  if (zoom > 100) {
+    display.fillRect(41, 46, 44, 8, SH110X_WHITE);
+    display.setTextColor(SH110X_BLACK);
+    display.setCursor(43, 46);
+    display.print("TELE IN");
+  } else if (zoom < -100) {
+    display.fillRect(41, 46, 44, 8, SH110X_WHITE);
+    display.setTextColor(SH110X_BLACK);
+    display.setCursor(43, 46);
+    display.print("WIDE OUT");
+  }
 
-  // Bottom Area: High-Contrast Popup Banner or Contextual Prompt
+  // Right Dial: Tilt (VRy on Right Joystick)
+  drawDial(105, 31, 11, tilt / 1000.0f, true, "TILT");
+
+  // Bottom Area: Banner or Context Prompt
   if (millis() < bannerExpireMs && strlen(bannerText) > 0) {
     int16_t textLen = strlen(bannerText);
-    int16_t boxW = min(SCREEN_WIDTH, (textLen * 6) + 12);
+    int16_t boxW = min((int16_t)126, (int16_t)((textLen * 6) + 10));
     int16_t boxX = (SCREEN_WIDTH - boxW) / 2;
-    display.fillRect(boxX, 53, boxW, 11, SH110X_WHITE);
+    display.fillRect(boxX, 54, boxW, 10, SH110X_WHITE);
     display.setTextColor(SH110X_BLACK);
-    display.setCursor(boxX + 6, 55);
+    display.setCursor(boxX + 5, 55);
     display.print(bannerText);
   } else {
     display.setTextColor(SH110X_WHITE);
-    display.setCursor(10, 55);
-    display.print("CON:PRESETS  ENC:MENU");
+    display.setCursor(4, 55);
+    display.print("CON:Menu  P1-3:Recall");
   }
 }
 
-// Preset Hub: 8 slots list view with page scrolling, instant recall, and hold-to-save
-void drawPresetsHub() {
-  display.setTextSize(1);
+// Fullscreen Dedicated Animated Homing Screen
+void drawHomingScreen() {
+  uint32_t now = millis();
 
-  // Title bar
+  // Top Header (Y: 2)
+  display.setTextSize(1);
+  display.setTextColor(SH110X_WHITE);
+  display.setCursor(6, 2);
+  display.print("--- HOMING MOUNT ---");
+
+  // Rotating Gyroscope / Radar in top right (X: 88..116, Y: 15..43)
+  int16_t cx = 102;
+  int16_t cy = 29;
+  display.drawCircle(cx, cy, 12, SH110X_WHITE);
+  display.drawFastHLine(cx - 12, cy, 25, SH110X_WHITE);
+  display.drawFastVLine(cx, cy - 12, 25, SH110X_WHITE);
+
+  float angle = (float)((now / 12) % 360) * 0.0174533f;
+  int16_t rx = cx + (int16_t)(cosf(angle) * 10);
+  int16_t ry = cy + (int16_t)(sinf(angle) * 10);
+  display.fillCircle(rx, ry, 2, SH110X_WHITE);
+
+  // Live Homing Axis Telemetry on Left
+  display.setCursor(2, 16);
+  display.printf("Pan : %+5.1f\xF7 %s",
+                 latestMountTelem.panDeg,
+                 latestMountTelem.panHallDetected ? "[ALIGN]" : "[FIND]");
+
+  display.setCursor(2, 27);
+  display.printf("Tilt: %+5.1f\xF7 %s",
+                 latestMountTelem.tiltDeg,
+                 latestMountTelem.tiltHallDetected ? "[ALIGN]" : "[FIND]");
+
+  display.setCursor(2, 38);
+  display.printf("Zoom: %3u%% Wide", latestMountTelem.zoomPct);
+
+  // Bottom Animated Progress Scanning Bar (X: 4..124, Y: 52..60)
+  display.drawRect(4, 52, 120, 9, SH110X_WHITE);
+  uint8_t barPhase = (now / 25) % 110;
+  display.fillRect(6 + barPhase, 54, 6, 5, SH110X_WHITE);
+}
+
+// Presets List: 8 Slots with custom string names
+void drawPresetsList() {
+  display.setTextSize(1);
   display.setTextColor(SH110X_WHITE);
   display.setCursor(2, 13);
-  display.print("PRESETS (PSH:Go Hld:Save)");
+  display.print("SELECT PRESET (1-8):");
 
-  // 4 items visible per page
-  uint8_t startIdx = ((presetHubSelected - 1) / 4) * 4;
+  // Show 4 visible presets per page
+  uint8_t startIdx = (presetListSelected / 4) * 4;
   for (uint8_t i = 0; i < 4; i++) {
     uint8_t slotIdx = startIdx + i;
     if (slotIdx >= 8) break;
 
-    uint8_t slotNum = slotIdx + 1;
     int16_t y = 24 + (i * 10);
-    bool isSelected = (slotNum == presetHubSelected);
+    bool isSelected = (slotIdx == presetListSelected);
 
     if (isSelected) {
       display.fillRect(0, y - 1, SCREEN_WIDTH, 10, SH110X_WHITE);
@@ -970,19 +1235,96 @@ void drawPresetsHub() {
     }
 
     display.setCursor(2, y);
-    display.printf("P%u:", slotNum);
+    display.printf("P%u: %-9.9s", slotIdx + 1, remotePresets[slotIdx].name);
 
     if (remotePresets[slotIdx].valid) {
-      display.setCursor(24, y);
-      display.printf("%+4.0f\xF7 %+3.0f\xF7  Zm:%2u%%",
-                     remotePresets[slotIdx].panDeg,
-                     remotePresets[slotIdx].tiltDeg,
-                     remotePresets[slotIdx].zoomPct);
+      display.setCursor(76, y);
+      display.printf("%+3.0f\xF7 Z:%2u%%", remotePresets[slotIdx].panDeg, remotePresets[slotIdx].zoomPct);
     } else {
-      display.setCursor(36, y);
-      display.print("[ EMPTY SLOT ]");
+      display.setCursor(80, y);
+      display.print("[EMPTY]");
     }
   }
+}
+
+// Preset Action Sub-Menu (Goto, Save, Rename, Back)
+void drawPresetAction() {
+  display.setTextSize(1);
+  display.setTextColor(SH110X_WHITE);
+
+  uint8_t slot = presetListSelected + 1;
+  display.setCursor(2, 13);
+  display.printf("PRESET %u: [%s]", slot, remotePresets[presetListSelected].name);
+
+  for (uint8_t i = 0; i < PACT_COUNT; i++) {
+    int16_t y = 25 + (i * 10);
+    bool isSelected = (i == presetActSelected);
+
+    if (isSelected) {
+      display.fillRect(0, y - 1, SCREEN_WIDTH, 10, SH110X_WHITE);
+      display.setTextColor(SH110X_BLACK);
+    } else {
+      display.setTextColor(SH110X_WHITE);
+    }
+
+    display.setCursor(4, y);
+    display.printf("%u. %s", i + 1, PRESET_ACTION_NAMES[i]);
+  }
+}
+
+// Interactive Character Wheel Name Editor
+void drawNameEditor() {
+  uint8_t slot = editNameSlotIdx + 1;
+  display.setTextSize(1);
+  display.setTextColor(SH110X_WHITE);
+
+  // Title
+  display.setCursor(2, 13);
+  display.printf("RENAME P%u (ROT+CONFIRM)", slot);
+
+  // Name Input Box
+  display.drawRect(2, 23, 124, 12, SH110X_WHITE);
+  display.setCursor(6, 25);
+  display.print(editNameBuffer);
+  // Blinking text cursor
+  if ((millis() / 350) % 2 == 0) {
+    display.print("_");
+  }
+
+  // Character Wheel Ribbon (5 symbols centered)
+  display.setCursor(2, 39);
+  display.print("Sym: ");
+
+  for (int16_t off = -2; off <= 2; off++) {
+    int16_t symbolIdx = editCharIdx + off;
+    while (symbolIdx < 0) symbolIdx += TOTAL_EDITOR_SYMBOLS;
+    symbolIdx = symbolIdx % TOTAL_EDITOR_SYMBOLS;
+
+    int16_t xPos = 34 + (off + 2) * 18;
+    int16_t yPos = 38;
+
+    if (off == 0) {
+      // Selected highlighted character
+      display.fillRect(xPos - 2, yPos - 1, 16, 10, SH110X_WHITE);
+      display.setTextColor(SH110X_BLACK);
+    } else {
+      display.setTextColor(SH110X_WHITE);
+    }
+
+    display.setCursor(xPos, yPos);
+    if (symbolIdx == CHAR_CODE_DEL) {
+      display.print("DEL");
+    } else if (symbolIdx == CHAR_CODE_SAVE) {
+      display.print("OK");
+    } else {
+      display.print(CHAR_SET[symbolIdx]);
+    }
+  }
+
+  // Footer Help
+  display.setTextColor(SH110X_WHITE);
+  display.setCursor(2, 53);
+  display.print("CON:Add  BAK:Del  OK:Save");
 }
 
 // Dedicated Scrolling System Log Console
@@ -998,7 +1340,6 @@ void drawLogs() {
     return;
   }
 
-  // Display up to 5 lines from circular log buffer with logScroll
   uint8_t visibleLines = min((uint8_t)5, logTotal);
   for (uint8_t i = 0; i < visibleLines; i++) {
     int lineIdx = (int)logHead - 1 - (int)logScroll - (int)(visibleLines - 1 - i);
@@ -1060,7 +1401,6 @@ void drawMenu() {
   display.drawRect(2, 13, 124, 50, SH110X_WHITE);
   char val[8];
 
-  // Up to 5 visible items with scrolling window
   uint8_t windowStart = 0;
   if ((uint8_t)menuSel >= 4) {
     windowStart = min((uint8_t)(menuSel - 3), (uint8_t)(MI_COUNT - 5));
@@ -1127,8 +1467,8 @@ void printMountConsoleSerial(bool forcePrint = false) {
                 latestMountTelem.panSteps, latestMountTelem.panDeg, panDirStr);
   Serial.printf("| Tilt Position : %+5ld stp (%+6.1f°) -> %s\n",
                 latestMountTelem.tiltSteps, latestMountTelem.tiltDeg, tiltDirStr);
-  Serial.printf("| Optical Zoom  : %4u ms / 3500 ms (%3u%% Telephoto)\n",
-                latestMountTelem.zoomMs, latestMountTelem.zoomPct);
+  Serial.printf("| Optical Zoom  : %4u ms / %u ms (%3u%% Telephoto)\n",
+                latestMountTelem.zoomMs, ZOOM_FULL_RANGE_MS, latestMountTelem.zoomPct);
 
   const char* stateStr = "IDLE (Standstill)";
   if (latestMountTelem.state == 1)      stateStr = "LIVE MOTOR MOTION";
@@ -1140,6 +1480,20 @@ void printMountConsoleSerial(bool forcePrint = false) {
     Serial.printf("| Last Event    : %s\n", latestMountTelem.eventMsg);
   }
   Serial.println("+-------------------------------------------------------------+\n");
+}
+
+void printButtonsSerial() {
+  Serial.println("\n--- Remote Pushbutton & Pin Status ---");
+  Serial.printf("  Left Stick SW  (GPIO 15): Pin=%d, Rest=%d -> %s\n", digitalRead(PIN_LJOY_SW), btnLJoy.restingState, btnLJoy.stable ? "PRESSED" : "RELEASED");
+  Serial.printf("  Right Stick SW (GPIO 16): Pin=%d, Rest=%d -> %s\n", digitalRead(PIN_RJOY_SW), btnRJoy.restingState, btnRJoy.stable ? "PRESSED" : "RELEASED");
+  Serial.printf("  Encoder Push   (GPIO 12): Pin=%d, Rest=%d -> %s\n", digitalRead(PIN_ENC_BTN), btnEnc.restingState, btnEnc.stable ? "PRESSED" : "RELEASED");
+  Serial.printf("  Confirm Button (GPIO 13): Pin=%d, Rest=%d -> %s\n", digitalRead(PIN_BTN_CON), btnCon.restingState, btnCon.stable ? "PRESSED" : "RELEASED");
+  Serial.printf("  Back Button    (GPIO 17): Pin=%d, Rest=%d -> %s\n", digitalRead(PIN_BTN_BAK), btnBak.restingState, btnBak.stable ? "PRESSED" : "RELEASED");
+  for (uint8_t i = 0; i < 5; i++) {
+    Serial.printf("  Color Button %u (GPIO %d): Pin=%d, Rest=%d -> %s\n",
+                  i + 1, PIN_COLOR_BTNS[i], digitalRead(PIN_COLOR_BTNS[i]), btnColor[i].restingState, btnColor[i].stable ? "PRESSED" : "RELEASED");
+  }
+  Serial.println("--------------------------------------\n");
 }
 
 void processSerialCli() {
@@ -1160,28 +1514,32 @@ void processSerialCli() {
   if (cmd == "help" || cmd == "?") {
     Serial.println("\n--- PTZ Remote Controller CLI Commands ---");
     Serial.println("  mount         : Display live Mount Diagnostics Console (UART, Hall, Zoom, Angles)");
+    Serial.println("  buttons       : Print live voltage & state of all remote pushbuttons");
     Serial.println("  save <1-8>    : Save current framing to Preset slot");
     Serial.println("  goto <1-8>    : Smoothly move camera to Preset slot");
     Serial.println("  home          : Trigger full Pan, Tilt & Zoom homing");
     Serial.println("  diag          : Switch OLED display to Mount Diagnostics screen");
     Serial.println("  main          : Switch OLED display to Main Dials screen");
+    Serial.println("  presets       : List all configured presets & names");
     Serial.println("  status        : Print current sticks, link status, and full mount telemetry");
     Serial.println("-------------------------------------------\n");
+  } else if (cmd == "buttons" || cmd == "pins") {
+    printButtonsSerial();
   } else if (cmd == "mount" || cmd == "telemetry") {
     printMountConsoleSerial(true);
   } else if (cmd == "diag") {
     uiMode = UI_DIAG;
     Serial.println("OLED switched to Mount Diagnostics screen.");
   } else if (cmd == "presets") {
-    uiMode = UI_PRESETS;
-    Serial.println("OLED switched to Preset Hub.");
+    uiMode = UI_PRESETS_LIST;
+    Serial.println("OLED switched to Presets List.");
     Serial.println("--- Remote Presets Cache ---");
     for (uint8_t i = 0; i < 8; i++) {
       if (remotePresets[i].valid) {
-        Serial.printf("  P%u: Pan=%+5.1f deg, Tilt=%+5.1f deg, Zoom=%u%%\n",
-                      i + 1, remotePresets[i].panDeg, remotePresets[i].tiltDeg, remotePresets[i].zoomPct);
+        Serial.printf("  P%u [%s]: Pan=%+5.1f deg, Tilt=%+5.1f deg, Zoom=%u%%\n",
+                      i + 1, remotePresets[i].name, remotePresets[i].panDeg, remotePresets[i].tiltDeg, remotePresets[i].zoomPct);
       } else {
-        Serial.printf("  P%u: [EMPTY]\n", i + 1);
+        Serial.printf("  P%u [%s]: [EMPTY]\n", i + 1, remotePresets[i].name);
       }
     }
   } else if (cmd == "logs") {
@@ -1205,9 +1563,10 @@ void processSerialCli() {
   } else if (cmd == "home") {
     commandStartHoming();
   } else if (cmd == "status") {
-    Serial.printf("[Status] Link: %s (Ch %u) | UI: %u | Active Slot: P%u\n",
+    Serial.printf("[Status] Link: %s (Ch %u) | UI: %u | Active Slot: P%u [%s]\n",
                   (linkState == LINK_PAIRED) ? "PAIRED" : "SCANNING",
-                  mountChannel, (uint8_t)uiMode, activePresetSlot);
+                  mountChannel, (uint8_t)uiMode, activePresetSlot,
+                  remotePresets[activePresetSlot - 1].name);
     printMountConsoleSerial(true);
   } else {
     Serial.printf("Unknown command: '%s'. Type 'help' for available commands.\n", cmd.c_str());
@@ -1236,13 +1595,18 @@ void setup() {
   // Calibrate joystick resting centers
   calibrateJoysticks();
 
-  // Pushbutton digital inputs
+  // Pushbutton digital inputs with internal pull-up resistors
   buttonInit(btnLJoy, PIN_LJOY_SW);
   buttonInit(btnRJoy, PIN_RJOY_SW);
   buttonInit(btnEnc,  PIN_ENC_BTN);
   buttonInit(btnCon,  PIN_BTN_CON);
   buttonInit(btnBak,  PIN_BTN_BAK);
-  for (uint8_t i = 0; i < 5; i++) buttonInit(btnColor[i], PIN_COLOR_BTNS[i]);
+  for (uint8_t i = 0; i < 5; i++) {
+    buttonInit(btnColor[i], PIN_COLOR_BTNS[i]);
+  }
+
+  // Calibrate baseline resting level for all pushbuttons
+  calibrateButtonRestingState();
 
   // Rotary encoder interrupts
   pinMode(PIN_ENC_A, INPUT_PULLUP);
@@ -1305,87 +1669,96 @@ void loop() {
   // 2. Link Management & Channel Scanning
   updateLink(now);
 
-  // 3. Read Joysticks
+  // 3. Update all button debouncers with baseline calibration
+  updateAllButtons();
+
+  // 4. Read Joysticks: Left Stick X -> Pan, Right Stick Y -> Tilt
   float lx = joyAxis(PIN_LJOY_X);
-  float ly = joyAxis(PIN_LJOY_Y);
   float rx = joyAxis(PIN_RJOY_X);
   float ry = joyAxis(PIN_RJOY_Y);
 
   if (settings.invertPan)  lx = -lx;
-  if (settings.invertTilt) ly = -ly;
+  if (settings.invertTilt) ry = -ry;
 
   int16_t pan  = (int16_t)constrain(lx * settings.sensitivity * 1000.0f, -1000, 1000);
-  int16_t tilt = (int16_t)constrain(ly * settings.sensitivity * 1000.0f, -1000, 1000);
+  int16_t tilt = (int16_t)constrain(ry * settings.sensitivity * 1000.0f, -1000, 1000);
   int16_t auxX = (int16_t)(rx * 1000.0f);
-  int16_t zoom = (int16_t)(ry * 1000.0f); // Right Stick Y: Positive=Tele/In, Negative=Wide/Out
 
-  // 4. Read Rotary Encoder & Navigation Buttons
+  // 5. Zoom Buttons: Color Btn 1 (GPIO 38) -> Zoom In, Color Btn 2 (GPIO 39) -> Zoom Out
+  int16_t zoom = 0;
+  if (uiMode == UI_LIVE) {
+    if (btnColor[0].stable) {
+      zoom = 1000;  // Zoom In / Telephoto
+    } else if (btnColor[1].stable) {
+      zoom = -1000; // Zoom Out / Wide
+    }
+  } else {
+    // When in Homing, Menus, or Dialogs, suppress stick and zoom motion
+    pan = 0;
+    tilt = 0;
+    zoom = 0;
+  }
+
+  // 6. Read Rotary Encoder & Menu Navigation
   int detents = encoderDetents();
   handleMenuInput(detents);
 
-  // 5. Joystick Button Click Actions
-  if (buttonPressed(btnLJoy)) {
+  // 7. Joystick Button Click Actions (Optional Shortcuts)
+  if (uiMode == UI_LIVE && buttonPressed(btnLJoy)) {
     // Left Stick Click: Cycle active preset slot (P1 -> P2 -> ... -> P8 -> P1)
     activePresetSlot = (activePresetSlot % 8) + 1;
-    char b[16];
-    snprintf(b, sizeof(b), "ACTIVE: P%u", activePresetSlot);
+    char b[24];
+    snprintf(b, sizeof(b), "ACTIVE: [%s]", remotePresets[activePresetSlot - 1].name);
     showBanner(b, 1800);
   }
 
-  // Right Stick Click: Save current framing into active preset slot (P1..P8)
-  if (buttonPressed(btnRJoy)) {
-    commandSavePreset(activePresetSlot);
-  }
-
-  // 6. Read 5 Color Preset Pushbuttons (Short Press = Recall, Long Press = Save)
-  for (uint8_t i = 0; i < 5; i++) {
-    uint8_t slot = i + 1;
-    buttonPressed(btnColor[i]);
-
-    if (buttonLongPressed(btnColor[i], 1200)) {
-      // Long press (>1.2s) -> Save current framing to preset slot
-      commandSavePreset(slot);
-    }
-
-    // On release after a short press (not long pressed):
-    if (digitalRead(btnColor[i].pin) == HIGH && btnColor[i].stable) {
-      if (!btnColor[i].longPressHandled && (now - btnColor[i].pressStartMs > 50)) {
+  // 8. Quick Recall Buttons: Color Buttons 3..5 (GPIO 40..42) -> Instant Recall Preset 1, 2, 3
+  if (uiMode == UI_LIVE) {
+    for (uint8_t i = 2; i < 5; i++) {
+      if (buttonPressed(btnColor[i])) {
+        uint8_t slot = (i - 2) + 1; // Btn3->P1, Btn4->P2, Btn5->P3
         commandGotoPreset(slot);
       }
-      btnColor[i].stable = false;
     }
   }
 
-  // 7. Stream 50 Hz Control Packets while Paired
+  // 9. Stream 50 Hz Control Packets while Paired
   if (linkState == LINK_PAIRED && now - lastTxMs >= TX_INTERVAL_MS) {
     lastTxMs = now;
     sendControl(pan, tilt, zoom, auxX, buildButtonBits());
   }
 
-  // 8. Render OLED Display (1.3" Adafruit SH1106G)
+  // 10. Render OLED Display (1.3" Adafruit SH1106G)
   if (displayActive) {
+    display.clearDisplay(); // Always clear entire buffer before rendering frame
+
     if (linkState != LINK_PAIRED) {
       drawSearchingScreen();
+    } else if (uiMode == UI_HOMING) {
+      drawHomingScreen();
     } else {
-      display.clearDisplay();
       drawStatusBar();
 
       if (uiMode == UI_MENU) {
         drawMenu();
-      } else if (uiMode == UI_PRESETS) {
-        drawPresetsHub();
+      } else if (uiMode == UI_PRESETS_LIST) {
+        drawPresetsList();
+      } else if (uiMode == UI_PRESET_ACTION) {
+        drawPresetAction();
+      } else if (uiMode == UI_NAME_EDITOR) {
+        drawNameEditor();
       } else if (uiMode == UI_LOGS) {
         drawLogs();
       } else if (uiMode == UI_DIAG) {
         drawMountDiag();
       } else {
-        drawMainUi(pan, tilt, zoom, auxX);
+        drawMainUi(pan, tilt, zoom);
       }
     }
     display.display();
   }
 
-  // 9. Periodic Serial Terminal Console (every 3 seconds)
+  // 11. Periodic Serial Terminal Console (every 3 seconds)
   printMountConsoleSerial(false);
 
   delay(5);
