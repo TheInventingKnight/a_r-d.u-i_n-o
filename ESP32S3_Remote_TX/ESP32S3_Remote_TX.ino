@@ -146,8 +146,8 @@ struct __attribute__((packed)) MountTelemetryPacket {
   int8_t   tiltSide;              // -1 = Down, 0 = Center, +1 = Up
   int32_t  panSteps;              // Current pan position in steps
   int32_t  tiltSteps;             // Current tilt position in steps
-  float    panDeg;                // Calculated pan angle in degrees (-180.0 .. +180.0)
-  float    tiltDeg;               // Calculated tilt angle in degrees (-90.0 .. +90.0)
+  float    panDeg;                // Calculated pan angle in degrees (-40.0 .. +40.0)
+  float    tiltDeg;               // Calculated tilt angle in degrees (-45.0 .. +45.0)
   uint16_t zoomMs;                // Current zoom dead-reckoning position (0..ZOOM_FULL_RANGE_MS)
   uint8_t  zoomPct;               // Zoom percentage (0..100%)
   uint8_t  isHomed;               // 1 if homing complete
@@ -1010,221 +1010,308 @@ void menuValueStr(MenuItem item, char* buf, size_t n) {
 // ---------------------------------------------------------------------------
 // OLED Display Rendering
 // ---------------------------------------------------------------------------
+// Grid constants (6x8 px per glyph, 21 chars max per row, content below status bar starts Y=13)
+// Row Y positions inside content area (below STATUS_BAR_H=11, separator line at Y=11):
+//   Row 0 (header)  : Y=13
+//   Row 1           : Y=23
+//   Row 2           : Y=33
+//   Row 3           : Y=43
+//   Row 4 (footer)  : Y=54   (last pixel row = 63)
+// Margins: left=2, right content edge=125 (21*6-1), avoid writing past col 125.
+
+// ---------------------------------------------------------------------------
+// Helper: draw a centered string on a given Y row (no wrap)
+// ---------------------------------------------------------------------------
+static void drawCentered(const char* str, int16_t y) {
+  int16_t w = (int16_t)(strlen(str) * 6);
+  int16_t x = (SCREEN_WIDTH - w) / 2;
+  if (x < 1) x = 1;
+  display.setCursor(x, y);
+  display.print(str);
+}
+
+// ---------------------------------------------------------------------------
+// Helper: draw a right-aligned string ending at pixel column `rightEdge`
+// ---------------------------------------------------------------------------
+static void drawRightAligned(const char* str, int16_t y, int16_t rightEdge = 126) {
+  int16_t w = (int16_t)(strlen(str) * 6);
+  int16_t x = rightEdge - w;
+  if (x < 1) x = 1;
+  display.setCursor(x, y);
+  display.print(str);
+}
+
+// ---------------------------------------------------------------------------
 // Fullscreen Animated Radar / Satellite Search Screen when unlinked
+// ---------------------------------------------------------------------------
 void drawSearchingScreen() {
   uint32_t now = millis();
-
-  int16_t cx = 64;
-  int16_t cy = 22;
-
-  // Expanding pulsing radar waves
-  uint8_t phase = (now / 35) % 24; // 0..23
-  for (uint8_t r = phase; r < 24; r += 8) {
-    if (r > 2) display.drawCircle(cx, cy, r, SH110X_WHITE);
-  }
-
-  // Central transmitter dot
-  display.fillCircle(cx, cy, 3, SH110X_WHITE);
-
-  // Rotating scanner sweep beam
-  float angle = (float)((now / 12) % 360) * 0.0174533f; // radians
-  int16_t bx = cx + (int16_t)(cosf(angle) * 20);
-  int16_t by = cy + (int16_t)(sinf(angle) * 20);
-  display.drawLine(cx, cy, bx, by, SH110X_WHITE);
-
-  // Status text
   display.setTextSize(1);
   display.setTextColor(SH110X_WHITE);
 
-  // Animated title
-  const char* title = "SEARCHING MOUNT";
-  int16_t tx = (SCREEN_WIDTH - (int16_t)(strlen(title) * 6)) / 2;
-  display.setCursor(tx - 6, 44);
-  display.print(title);
+  // Pulsing radar at top-center
+  const int16_t cx = 64, cy = 22;
+  uint8_t phase = (uint8_t)((now / 35) % 24);
+  for (uint8_t r = phase; r < 24; r += 8) {
+    if (r > 2) display.drawCircle(cx, cy, r, SH110X_WHITE);
+  }
+  display.fillCircle(cx, cy, 3, SH110X_WHITE);
 
-  // Animated dots ...
-  uint8_t numDots = (now / 300) % 4;
-  for (uint8_t d = 0; d < numDots; d++) display.print(".");
+  // Rotating sweep line
+  float angle = (float)((now / 12) % 360) * 0.0174533f;
+  int16_t bx = cx + (int16_t)(cosf(angle) * 19);
+  int16_t by = cy + (int16_t)(sinf(angle) * 19);
+  display.drawLine(cx, cy, bx, by, SH110X_WHITE);
 
-  // Subtitle
-  char sub[32];
-  snprintf(sub, sizeof(sub), "Scan Ch %u  |  21dBm Max", scanChannel);
-  int16_t sx = (SCREEN_WIDTH - (int16_t)(strlen(sub) * 6)) / 2;
-  if (sx < 0) sx = 0;
-  display.setCursor(sx, 55);
+  // "SEARCHING MOUNT" centered at Y=44
+  char title[20];
+  uint8_t dots = (uint8_t)((now / 400) % 4);
+  snprintf(title, sizeof(title), "SEARCHING MOUNT%s",
+           dots == 0 ? "" : dots == 1 ? "." : dots == 2 ? ".." : "...");
+  drawCentered(title, 44);
+
+  // Channel info, max 21 chars: "Ch 13  21dBm"
+  char sub[22];
+  snprintf(sub, sizeof(sub), "Ch %-2u  21 dBm  ESP-NOW", scanChannel);
+  sub[21] = '\0';
+  display.setCursor(2, 55);
   display.print(sub);
 }
 
-// Clean Status Bar: Battery | Active Preset Name Badge | Link Status
+// ---------------------------------------------------------------------------
+// Status Bar: Battery | Preset Badge | Link  (Y: 0..10, separator Y=11)
+// ---------------------------------------------------------------------------
 void drawStatusBar() {
   float volts = filteredBatteryVoltage();
   int   pct   = batteryPercent(volts);
   bool  usb   = usbConnected();
 
   display.setTextSize(1);
+  display.setTextColor(SH110X_WHITE);
 
-  // 1. Left: Battery Gauge or Charge ETA (X: 1..32)
+  // ── Left: battery gauge (cols 0..30) ──
   if (usb) {
+    // Lightning bolt icon (7px wide)
     display.fillTriangle(1, 0, 5, 0, 3, 4, SH110X_WHITE);
     display.fillTriangle(3, 4, 7, 4, 2, 9, SH110X_WHITE);
-    display.setTextColor(SH110X_WHITE);
+    // Charge ETA, max 5 chars "999m" → col 9
+    char eta[6];
+    snprintf(eta, sizeof(eta), "%um", chargeEtaMinutes(pct));
     display.setCursor(9, 1);
-    display.printf("%dm", chargeEtaMinutes(pct));
+    display.print(eta);
   } else {
+    // Battery outline 13x8 + nub 2x4
     display.drawRect(0, 1, 13, 8, SH110X_WHITE);
     display.fillRect(13, 3, 2, 4, SH110X_WHITE);
     int fillW = (11 * pct) / 100;
     if (fillW > 0) display.fillRect(1, 2, fillW, 6, SH110X_WHITE);
-    display.setTextColor(SH110X_WHITE);
-    display.setCursor(17, 1);
-    display.printf("%d%%", pct);
+    // Pct text, max "100%" = 4 chars → cols 15..38
+    char pctStr[5];
+    snprintf(pctStr, sizeof(pctStr), "%d%%", pct);
+    display.setCursor(16, 1);
+    display.print(pctStr);
   }
 
-  // 2. Center: Active Preset Name Badge
-  display.setTextColor(SH110X_WHITE);
+  // ── Right: link badge, right-aligned to col 126, max 6 chars ──
+  // "[LINK]" or "[SCAN]"
+  const char* linkBadge = (linkState == LINK_PAIRED) ? "[LINK]" : "[SCAN]";
+  drawRightAligned(linkBadge, 1, 127);
+
+  // ── Center: active preset name badge, max 8 chars + brackets = 10 chars ──
+  // Sits between col 40 and col 86 (centered)
   uint8_t activeIdx = activePresetSlot - 1;
   const char* activeName = (activeIdx < 8 && strlen(remotePresets[activeIdx].name) > 0)
-                           ? remotePresets[activeIdx].name : DEFAULT_PRESET_NAMES[activeIdx];
-  char badge[16];
+                           ? remotePresets[activeIdx].name
+                           : DEFAULT_PRESET_NAMES[activeIdx];
+  char badge[12];
   snprintf(badge, sizeof(badge), "[%.8s]", activeName);
-  int16_t badgeW = strlen(badge) * 6;
+  // Force center between the two flanking elements (col 40..86)
+  int16_t badgeW = (int16_t)(strlen(badge) * 6);
   int16_t badgeX = (SCREEN_WIDTH - badgeW) / 2;
+  if (badgeX < 36) badgeX = 36;
   display.setCursor(badgeX, 1);
   display.print(badge);
 
-  // 3. Right: Clean Link Status Badge (X: 92..126)
-  display.setCursor(92, 1);
-  if (linkState == LINK_PAIRED) {
-    display.print("[LINK]");
-  } else {
-    display.print("[SCAN]");
-  }
-
+  // ── Separator line ──
   display.drawFastHLine(0, STATUS_BAR_H, SCREEN_WIDTH, SH110X_WHITE);
 }
 
+// ---------------------------------------------------------------------------
+// Pan/Tilt dial widget (used on live view)
+// ---------------------------------------------------------------------------
 void drawDial(int16_t cx, int16_t cy, int16_t r, float val, bool isVertical, const char* label) {
   display.drawCircle(cx, cy, r, SH110X_WHITE);
   display.drawFastHLine(cx - r + 2, cy, 2 * r - 3, SH110X_WHITE);
   display.drawFastVLine(cx, cy - r + 2, 2 * r - 3, SH110X_WHITE);
 
-  int16_t dx = cx;
-  int16_t dy = cy;
-  if (isVertical) {
-    dy = cy - (int16_t)(val * (r - 4));
-  } else {
-    dx = cx + (int16_t)(val * (r - 4));
-  }
+  int16_t dx = cx, dy = cy;
+  if (isVertical) dy = cy - (int16_t)(val * (r - 4));
+  else            dx = cx + (int16_t)(val * (r - 4));
   display.fillCircle(dx, dy, 2, SH110X_WHITE);
 
   int16_t tx = cx - (int16_t)(strlen(label) * 3);
-  display.setTextColor(SH110X_WHITE);
   display.setCursor(tx, cy + r + 2);
+  display.setTextColor(SH110X_WHITE);
   display.print(label);
 }
 
+// ---------------------------------------------------------------------------
+// Main Live View (below status bar)
+// ---------------------------------------------------------------------------
 void drawMainUi(int16_t pan, int16_t tilt, int16_t zoom) {
-  // Left Dial: Pan (VRx on Left Joystick)
-  drawDial(22, 31, 11, pan / 1000.0f, false, "PAN");
-
-  // Center live telemetry readouts & Zoom state
   display.setTextSize(1);
   display.setTextColor(SH110X_WHITE);
-  display.setCursor(41, 16);
+
+  // Left dial: Pan   (cx=22, cy=35, r=11)
+  drawDial(22, 35, 11, pan / 1000.0f, false, "PAN");
+
+  // Right dial: Tilt (cx=105, cy=35, r=11)
+  drawDial(105, 35, 11, tilt / 1000.0f, true, "TILT");
+
+  // Center telemetry column (X=44..84, 7 chars max per line)
+  // Row Y=14: Pan angle   "P: +40°"
+  // Row Y=24: Tilt angle  "T: -45°"
+  // Row Y=34: Zoom pct    "Z: 100%"
+  display.setCursor(44, 14);
   display.printf("P:%+4.0f\xF7", latestMountTelem.panDeg);
-  display.setCursor(41, 26);
+  display.setCursor(44, 24);
   display.printf("T:%+4.0f\xF7", latestMountTelem.tiltDeg);
-  display.setCursor(41, 36);
+  display.setCursor(44, 34);
   display.printf("Z:%3u%%", latestMountTelem.zoomPct);
 
-  // Zoom In / Out Active Indicator Badge
+  // Zoom action badge (Y=44, 7 chars inverted)  "TELE IN" / "WIDE OUT"
   if (zoom > 100) {
-    display.fillRect(41, 46, 44, 8, SH110X_WHITE);
+    display.fillRect(40, 43, 48, 9, SH110X_WHITE);
     display.setTextColor(SH110X_BLACK);
-    display.setCursor(43, 46);
+    display.setCursor(42, 44);
     display.print("TELE IN");
+    display.setTextColor(SH110X_WHITE);
   } else if (zoom < -100) {
-    display.fillRect(41, 46, 44, 8, SH110X_WHITE);
+    display.fillRect(40, 43, 48, 9, SH110X_WHITE);
     display.setTextColor(SH110X_BLACK);
-    display.setCursor(43, 46);
+    display.setCursor(42, 44);
     display.print("WIDE OUT");
+    display.setTextColor(SH110X_WHITE);
   }
 
-  // Right Dial: Tilt (VRy on Right Joystick)
-  drawDial(105, 31, 11, tilt / 1000.0f, true, "TILT");
-
-  // Bottom Area: Banner or Context Prompt
+  // Footer row Y=55: Banner OR hint (max 21 chars)
   if (millis() < bannerExpireMs && strlen(bannerText) > 0) {
-    int16_t textLen = strlen(bannerText);
-    int16_t boxW = min((int16_t)126, (int16_t)((textLen * 6) + 10));
+    char trunc[22];
+    snprintf(trunc, sizeof(trunc), "%.21s", bannerText);
+    int16_t boxW = (int16_t)(strlen(trunc) * 6 + 4);
+    if (boxW > 126) boxW = 126;
     int16_t boxX = (SCREEN_WIDTH - boxW) / 2;
-    display.fillRect(boxX, 54, boxW, 10, SH110X_WHITE);
+    display.fillRect(boxX, 53, boxW, 10, SH110X_WHITE);
     display.setTextColor(SH110X_BLACK);
-    display.setCursor(boxX + 5, 55);
-    display.print(bannerText);
-  } else {
+    display.setCursor(boxX + 2, 55);
+    display.print(trunc);
     display.setTextColor(SH110X_WHITE);
-    display.setCursor(4, 55);
-    display.print("CON:Menu  P1-3:Recall");
+  } else {
+    // "CON:Menu  B3-5:Recall" = 21 chars exactly
+    display.setCursor(2, 55);
+    display.print("CON:Menu B3-5:Recall");
   }
 }
 
-// Fullscreen Dedicated Animated Homing Screen
+// ---------------------------------------------------------------------------
+// Fullscreen Animated Homing Screen (Professional / No Overlap)
+// ---------------------------------------------------------------------------
 void drawHomingScreen() {
   uint32_t now = millis();
-
-  // Top Header (Y: 2)
   display.setTextSize(1);
   display.setTextColor(SH110X_WHITE);
-  display.setCursor(6, 2);
-  display.print("--- HOMING MOUNT ---");
 
-  // Rotating Gyroscope / Radar in top right (X: 88..116, Y: 15..43)
-  int16_t cx = 102;
-  int16_t cy = 29;
-  display.drawCircle(cx, cy, 12, SH110X_WHITE);
-  display.drawFastHLine(cx - 12, cy, 25, SH110X_WHITE);
-  display.drawFastVLine(cx, cy - 12, 25, SH110X_WHITE);
+  // ── Title bar (full width inverted, Y=0..9) ──
+  display.fillRect(0, 0, SCREEN_WIDTH, 10, SH110X_WHITE);
+  display.setTextColor(SH110X_BLACK);
+  drawCentered("  HOMING MOUNT  ", 1);
+  display.setTextColor(SH110X_WHITE);
 
-  float angle = (float)((now / 12) % 360) * 0.0174533f;
-  int16_t rx = cx + (int16_t)(cosf(angle) * 10);
-  int16_t ry = cy + (int16_t)(sinf(angle) * 10);
-  display.fillCircle(rx, ry, 2, SH110X_WHITE);
+  // ── Pan row (Y=13) ──
+  // Layout: "PAN" label + status badge + angle, all <=21 chars
+  // "PAN   +40.0   ALIGN" 19 chars
+  // "PAN   +40.0  SEARCH" 19 chars
+  {
+    const char* panStatus = latestMountTelem.panHallDetected ? "ALIGN" : "SRCH ";
+    char panLine[22];
+    snprintf(panLine, sizeof(panLine), "PAN %+6.1f\xF7  %-5s",
+             latestMountTelem.panDeg, panStatus);
+    display.setCursor(2, 13);
+    display.print(panLine);
+  }
 
-  // Live Homing Axis Telemetry on Left
-  display.setCursor(2, 16);
-  display.printf("Pan : %+5.1f\xF7 %s",
-                 latestMountTelem.panDeg,
-                 latestMountTelem.panHallDetected ? "[ALIGN]" : "[FIND]");
+  // ── Tilt row (Y=23) ──
+  {
+    const char* tiltStatus = latestMountTelem.tiltHallDetected ? "ALIGN" : "SRCH ";
+    char tiltLine[22];
+    snprintf(tiltLine, sizeof(tiltLine), "TLT %+6.1f\xF7  %-5s",
+             latestMountTelem.tiltDeg, tiltStatus);
+    display.setCursor(2, 23);
+    display.print(tiltLine);
+  }
 
-  display.setCursor(2, 27);
-  display.printf("Tilt: %+5.1f\xF7 %s",
-                 latestMountTelem.tiltDeg,
-                 latestMountTelem.tiltHallDetected ? "[ALIGN]" : "[FIND]");
+  // ── Zoom row (Y=33) ──
+  {
+    char zoomLine[22];
+    snprintf(zoomLine, sizeof(zoomLine), "ZOM  %3u%%  Wide->0%%", latestMountTelem.zoomPct);
+    display.setCursor(2, 33);
+    display.print(zoomLine);
+  }
 
-  display.setCursor(2, 38);
-  display.printf("Zoom: %3u%% Wide", latestMountTelem.zoomPct);
+  // ── Event message (latest telemetry from mount, Y=43, max 21 chars) ──
+  {
+    char evLine[22];
+    snprintf(evLine, sizeof(evLine), "%-21.21s", latestMountTelem.eventMsg);
+    display.setCursor(2, 43);
+    display.print(evLine);
+  }
 
-  // Bottom Animated Progress Scanning Bar (X: 4..124, Y: 52..60)
-  display.drawRect(4, 52, 120, 9, SH110X_WHITE);
-  uint8_t barPhase = (now / 25) % 110;
-  display.fillRect(6 + barPhase, 54, 6, 5, SH110X_WHITE);
+  // ── Animated scanner progress bar (Y=53..62) ──
+  display.drawRect(2, 53, 124, 10, SH110X_WHITE);
+  // Bouncing shuttle
+  uint32_t period = 1200; // ms for one full pass
+  uint32_t t = now % (period * 2);
+  int16_t barLen = 18;
+  int16_t travel = 124 - 4 - barLen; // inner pixels
+  int16_t pos;
+  if (t < period) {
+    pos = (int16_t)((t * travel) / period);
+  } else {
+    pos = (int16_t)(((t - period) * travel) / period);
+    pos = travel - pos;
+  }
+  display.fillRect(4 + pos, 55, barLen, 6, SH110X_WHITE);
+
+  // ── Axis locked checkmarks (right side, shown when ALIGN) ──
+  // Small "ok" glyphs at X=116, Y=13 and Y=23
+  if (latestMountTelem.panHallDetected) {
+    display.setCursor(116, 13);
+    display.print("\x02"); // STX char renders as a small mark on SH110X gfx font — use a simple square
+    display.fillRect(118, 14, 5, 5, SH110X_WHITE); // filled square = locked
+  }
+  if (latestMountTelem.tiltHallDetected) {
+    display.fillRect(118, 24, 5, 5, SH110X_WHITE);
+  }
 }
 
-// Presets List: 8 Slots with custom string names
+// ---------------------------------------------------------------------------
+// Presets List: 8 Slots  (4 visible, scrolling page)
+// ---------------------------------------------------------------------------
 void drawPresetsList() {
   display.setTextSize(1);
   display.setTextColor(SH110X_WHITE);
-  display.setCursor(2, 13);
-  display.print("SELECT PRESET (1-8):");
 
-  // Show 4 visible presets per page
+  // Header row Y=13
+  display.setCursor(2, 13);
+  display.print("PRESETS  (ENC=scroll)");
+
+  // 4 rows visible, Y=23/33/43/53
   uint8_t startIdx = (presetListSelected / 4) * 4;
   for (uint8_t i = 0; i < 4; i++) {
     uint8_t slotIdx = startIdx + i;
     if (slotIdx >= 8) break;
 
-    int16_t y = 24 + (i * 10);
+    int16_t y = 23 + (i * 10);
     bool isSelected = (slotIdx == presetListSelected);
 
     if (isSelected) {
@@ -1234,30 +1321,52 @@ void drawPresetsList() {
       display.setTextColor(SH110X_WHITE);
     }
 
-    display.setCursor(2, y);
-    display.printf("P%u: %-9.9s", slotIdx + 1, remotePresets[slotIdx].name);
+    // "P1 Pulpit     +40 Z99" = 21 chars max
+    // Slot num + name (8 chars) + right side angle+zoom
+    char nameCol[9];
+    snprintf(nameCol, sizeof(nameCol), "%-8.8s", remotePresets[slotIdx].name);
 
+    char rightCol[8];
     if (remotePresets[slotIdx].valid) {
-      display.setCursor(76, y);
-      display.printf("%+3.0f\xF7 Z:%2u%%", remotePresets[slotIdx].panDeg, remotePresets[slotIdx].zoomPct);
+      snprintf(rightCol, sizeof(rightCol), "%+4.0f\xF7", remotePresets[slotIdx].panDeg);
     } else {
-      display.setCursor(80, y);
-      display.print("[EMPTY]");
+      snprintf(rightCol, sizeof(rightCol), " EMPTY");
     }
+
+    display.setCursor(2, y);
+    display.printf("P%u %.8s", slotIdx + 1, remotePresets[slotIdx].name);
+
+    // Right-align the angle/status
+    drawRightAligned(rightCol, y, 126);
+
+    display.setTextColor(SH110X_WHITE);
   }
 }
 
+// ---------------------------------------------------------------------------
 // Preset Action Sub-Menu (Goto, Save, Rename, Back)
+// ---------------------------------------------------------------------------
 void drawPresetAction() {
   display.setTextSize(1);
   display.setTextColor(SH110X_WHITE);
 
+  // Header: "P1: Pulpit" — truncate name to 8 chars to stay <=18 chars total
   uint8_t slot = presetListSelected + 1;
+  char header[22];
+  snprintf(header, sizeof(header), "P%u: %.14s", slot, remotePresets[presetListSelected].name);
   display.setCursor(2, 13);
-  display.printf("PRESET %u: [%s]", slot, remotePresets[presetListSelected].name);
+  display.print(header);
+
+  // 4 action rows at Y=23/33/43/53
+  static const char* shortNames[PACT_COUNT] = {
+    "Goto Position",
+    "Save Framing",
+    "Rename",
+    "Back"
+  };
 
   for (uint8_t i = 0; i < PACT_COUNT; i++) {
-    int16_t y = 25 + (i * 10);
+    int16_t y = 23 + (i * 10);
     bool isSelected = (i == presetActSelected);
 
     if (isSelected) {
@@ -1268,44 +1377,49 @@ void drawPresetAction() {
     }
 
     display.setCursor(4, y);
-    display.printf("%u. %s", i + 1, PRESET_ACTION_NAMES[i]);
+    display.printf("%u. %s", i + 1, shortNames[i]);
+    display.setTextColor(SH110X_WHITE);
   }
 }
 
+// ---------------------------------------------------------------------------
 // Interactive Character Wheel Name Editor
+// ---------------------------------------------------------------------------
 void drawNameEditor() {
   uint8_t slot = editNameSlotIdx + 1;
   display.setTextSize(1);
   display.setTextColor(SH110X_WHITE);
 
-  // Title
+  // Title row Y=13: "RENAME P1" (9 chars, safe)
+  char title[22];
+  snprintf(title, sizeof(title), "RENAME PRESET %u", slot);
   display.setCursor(2, 13);
-  display.printf("RENAME P%u (ROT+CONFIRM)", slot);
+  display.print(title);
 
-  // Name Input Box
-  display.drawRect(2, 23, 124, 12, SH110X_WHITE);
-  display.setCursor(6, 25);
+  // Name input box Y=22..33, inner text Y=24
+  display.drawRect(2, 22, 124, 12, SH110X_WHITE);
+  display.setCursor(5, 24);
   display.print(editNameBuffer);
-  // Blinking text cursor
-  if ((millis() / 350) % 2 == 0) {
-    display.print("_");
+  // Blinking cursor
+  if ((millis() / 400) % 2 == 0) {
+    size_t len = strlen(editNameBuffer);
+    int16_t curX = 5 + (int16_t)(len * 6);
+    if (curX < 122) {
+      display.drawFastVLine(curX, 24, 7, SH110X_WHITE);
+    }
   }
 
-  // Character Wheel Ribbon (5 symbols centered)
-  display.setCursor(2, 39);
-  display.print("Sym: ");
-
+  // Character ribbon (Y=37): 5 symbols, centered, 14px each
+  // Positions: center=64, offsets -2,-1,0,+1,+2 → X = 8,22,36,50,64... → use 12px spacing
+  // Ribbon area: 5 chars * 14px = 70px, start X = (128-70)/2 = 29
   for (int16_t off = -2; off <= 2; off++) {
-    int16_t symbolIdx = editCharIdx + off;
-    while (symbolIdx < 0) symbolIdx += TOTAL_EDITOR_SYMBOLS;
-    symbolIdx = symbolIdx % TOTAL_EDITOR_SYMBOLS;
+    int16_t symbolIdx = (editCharIdx + off + TOTAL_EDITOR_SYMBOLS * 4) % TOTAL_EDITOR_SYMBOLS;
 
-    int16_t xPos = 34 + (off + 2) * 18;
-    int16_t yPos = 38;
+    int16_t xPos = 64 + off * 14 - 5; // center at 64, each slot 14px wide
+    int16_t yPos = 37;
 
     if (off == 0) {
-      // Selected highlighted character
-      display.fillRect(xPos - 2, yPos - 1, 16, 10, SH110X_WHITE);
+      display.fillRect(xPos - 2, yPos - 1, 14, 10, SH110X_WHITE);
       display.setTextColor(SH110X_BLACK);
     } else {
       display.setTextColor(SH110X_WHITE);
@@ -1313,120 +1427,164 @@ void drawNameEditor() {
 
     display.setCursor(xPos, yPos);
     if (symbolIdx == CHAR_CODE_DEL) {
-      display.print("DEL");
+      display.print("<X");
     } else if (symbolIdx == CHAR_CODE_SAVE) {
       display.print("OK");
     } else {
       display.print(CHAR_SET[symbolIdx]);
     }
+    display.setTextColor(SH110X_WHITE);
   }
 
-  // Footer Help
-  display.setTextColor(SH110X_WHITE);
-  display.setCursor(2, 53);
-  display.print("CON:Add  BAK:Del  OK:Save");
+  // Ribbon arrows at sides
+  display.setCursor(2, 37);
+  display.print("<");
+  display.setCursor(120, 37);
+  display.print(">");
+
+  // Footer help row Y=52 (max 21 chars)
+  // "CON:Add BAK:Del OK:Sv" = 21
+  display.setCursor(2, 52);
+  display.print("CON:Add BAK:Del OK:Sv");
 }
 
+// ---------------------------------------------------------------------------
 // Dedicated Scrolling System Log Console
+// ---------------------------------------------------------------------------
 void drawLogs() {
   display.setTextSize(1);
   display.setTextColor(SH110X_WHITE);
+
+  // Header Y=13 (max 21 chars: "SYSTEM LOGS  BAK:exit")
   display.setCursor(2, 13);
-  display.print("SYSTEM LOGS (Scroll)");
+  display.print("SYSTEM LOGS BAK:exit");
+
+  display.drawFastHLine(0, 22, SCREEN_WIDTH, SH110X_WHITE);
 
   if (logTotal == 0) {
-    display.setCursor(14, 34);
-    display.print("No logged events yet");
+    drawCentered("No events logged", 38);
     return;
   }
 
+  // 5 lines visible, each row 8px high, Y=24/32/40/48/56
   uint8_t visibleLines = min((uint8_t)5, logTotal);
   for (uint8_t i = 0; i < visibleLines; i++) {
     int lineIdx = (int)logHead - 1 - (int)logScroll - (int)(visibleLines - 1 - i);
     while (lineIdx < 0) lineIdx += MAX_LOG_LINES;
     lineIdx = lineIdx % MAX_LOG_LINES;
 
-    int16_t y = 23 + (i * 8);
+    int16_t y = 24 + (i * 8);
+    // Truncate to 21 chars to avoid overflow
+    char truncated[22];
+    snprintf(truncated, sizeof(truncated), "%.21s", logLines[lineIdx]);
     display.setCursor(2, y);
-    display.print(logLines[lineIdx]);
+    display.print(truncated);
   }
 }
 
+// ---------------------------------------------------------------------------
+// Mount Diagnostics Screen
+// ---------------------------------------------------------------------------
 void drawMountDiag() {
   display.setTextSize(1);
   display.setTextColor(SH110X_WHITE);
 
-  // Line 1: Header / Link
+  // Header Y=13
   display.setCursor(2, 13);
+  display.print("MOUNT DIAG  BAK:exit");
+
   if (linkState != LINK_PAIRED || !hasMountTelem) {
-    display.print("SEARCHING MOUNT...");
-    display.setCursor(2, 26);
-    display.printf("Scan Wi-Fi Ch: %u", scanChannel);
-    display.setCursor(2, 38);
-    display.print("Waiting for Mount RX");
-    display.setCursor(2, 53);
-    display.print("BAK: Exit to Menu");
+    drawCentered("Searching mount...", 32);
+    char chLine[22];
+    snprintf(chLine, sizeof(chLine), "Scan Ch: %-2u", scanChannel);
+    drawCentered(chLine, 42);
     return;
   }
 
-  // Line 2: UART Health (authentic TMC2209 silicon 0x21 check)
-  display.printf("UART: P:%s  T:%s",
-                 latestMountTelem.panUartOk ? "OK" : "ERR",
-                 latestMountTelem.tiltUartOk ? "OK" : "ERR");
-
-  // Line 3: Hall Effect Sensors
+  // Line 1 Y=23: "UART P:OK  T:OK" (15 chars)
   display.setCursor(2, 23);
-  display.printf("Hall: P:%s T:%s",
-                 latestMountTelem.panHallDetected ? "DETECT" : "CLEAR",
-                 latestMountTelem.tiltHallDetected ? "DETECT" : "CLEAR");
+  display.printf("UART P:%s T:%s",
+                 latestMountTelem.panUartOk  ? "OK " : "ERR",
+                 latestMountTelem.tiltUartOk ? "OK " : "ERR");
 
-  // Line 4: Pan Position & Direction away from Hall
-  const char* pDir = (latestMountTelem.panHallDetected || abs(latestMountTelem.panSteps) < 50)
-                     ? "CTR" : (latestMountTelem.panSteps > 0 ? "RIGHT" : "LEFT");
+  // Line 2 Y=33: "HALL P:DETECT T:CLEAR" → 21 chars max
+  // Use shorter tokens: "ON"/"--"
   display.setCursor(2, 33);
-  display.printf("Pan : %+5.1f\xF7 (%s)", latestMountTelem.panDeg, pDir);
+  display.printf("HALL P:%-6s T:%-6s",
+                 latestMountTelem.panHallDetected  ? "DETCT" : "CLEAR",
+                 latestMountTelem.tiltHallDetected ? "DETCT" : "CLEAR");
 
-  // Line 5: Tilt Position & Direction away from Hall
-  const char* tDir = (latestMountTelem.tiltHallDetected || abs(latestMountTelem.tiltSteps) < 25)
-                     ? "CTR" : (latestMountTelem.tiltSteps > 0 ? "UP" : "DOWN");
+  // Line 3 Y=43: "PAN   +40.0  RIGHT" (18 chars)
+  const char* pDir = (abs(latestMountTelem.panSteps) < 50)
+                     ? "CTR" : (latestMountTelem.panSteps > 0 ? "CW " : "CCW");
   display.setCursor(2, 43);
-  display.printf("Tilt: %+5.1f\xF7 (%s)", latestMountTelem.tiltDeg, tDir);
+  display.printf("PAN %+6.1f\xF7 %s", latestMountTelem.panDeg, pDir);
 
-  // Line 6: Zoom Dead-Reckoning & Exit prompt
+  // Line 4 Y=53: "TLT  -45.0  DOWN  Z:55%" → split across two short items
+  const char* tDir = (abs(latestMountTelem.tiltSteps) < 25)
+                     ? "CTR" : (latestMountTelem.tiltSteps > 0 ? "UP " : "DWN");
   display.setCursor(2, 53);
-  display.printf("Zm:%u%% [BAK:Exit]", latestMountTelem.zoomPct);
+  display.printf("TLT %+5.1f\xF7 %s Z:%u%%",
+                 latestMountTelem.tiltDeg, tDir, latestMountTelem.zoomPct);
 }
 
+// ---------------------------------------------------------------------------
+// Main Menu (scrolling window of 5 rows)
+// ---------------------------------------------------------------------------
 void drawMenu() {
-  display.drawRect(2, 13, 124, 50, SH110X_WHITE);
-  char val[8];
+  display.setTextSize(1);
+  display.setTextColor(SH110X_WHITE);
+
+  // Title row Y=13 inverted
+  display.fillRect(0, 13, SCREEN_WIDTH, 9, SH110X_WHITE);
+  display.setTextColor(SH110X_BLACK);
+  drawCentered("REMOTE MENU", 14);
+  display.setTextColor(SH110X_WHITE);
 
   uint8_t windowStart = 0;
   if ((uint8_t)menuSel >= 4) {
     windowStart = min((uint8_t)(menuSel - 3), (uint8_t)(MI_COUNT - 5));
   }
 
-  for (uint8_t row = 0; row < 5; row++) {
+  // 4 rows at Y=23/33/43/53
+  for (uint8_t row = 0; row < 4; row++) {
     uint8_t i = windowStart + row;
     if (i >= MI_COUNT) break;
 
-    int16_t y = 16 + row * 9;
-    bool selected = (i == (uint8_t)menuSel);
-    bool editing  = selected && menuEditing;
+    int16_t y = 23 + row * 10;
+    bool isSelected = (i == (uint8_t)menuSel);
+    bool isEditing  = isSelected && menuEditing;
 
-    if (selected) {
-      display.fillRect(3, y - 1, 122, 9, SH110X_WHITE);
+    if (isSelected) {
+      display.fillRect(0, y - 1, SCREEN_WIDTH, 10, SH110X_WHITE);
       display.setTextColor(SH110X_BLACK);
     } else {
       display.setTextColor(SH110X_WHITE);
     }
-    display.setCursor(6, y);
+
+    display.setCursor(4, y);
     display.print(MENU_NAMES[i]);
+
+    char val[8];
     menuValueStr((MenuItem)i, val, sizeof(val));
     if (strlen(val) > 0) {
-      display.setCursor(120 - strlen(val) * 6 - (editing ? 6 : 0), y);
-      display.print(val);
-      if (editing) display.print("<");
+      // Right-align value (with edit arrow if editing)
+      char valStr[10];
+      if (isEditing) snprintf(valStr, sizeof(valStr), "%s<", val);
+      else           strncpy(valStr, val, sizeof(valStr));
+      drawRightAligned(valStr, y, 124);
+    }
+
+    display.setTextColor(SH110X_WHITE);
+  }
+
+  // Scroll indicator dots bottom-right
+  if (MI_COUNT > 4) {
+    uint8_t pageMax = (MI_COUNT - 1) / 4;
+    uint8_t curPage = (uint8_t)menuSel / 4;
+    for (uint8_t p = 0; p <= pageMax; p++) {
+      if (p == curPage) display.fillRect(123, 23 + p * 8, 3, 3, SH110X_WHITE);
+      else              display.drawRect(123, 23 + p * 8, 3, 3, SH110X_WHITE);
     }
   }
 }
