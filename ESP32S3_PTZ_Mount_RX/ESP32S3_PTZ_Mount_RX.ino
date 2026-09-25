@@ -102,17 +102,17 @@ const char* WIFI_PASS = "windows12";
 //   Pan Axis : 17T Motor -> 144T Driven (Ratio = 144/17 ~ 8.470588)
 //              Output rev = 3200 * 144 / 17 = 460800 / 17 ~ 27105.88 steps / 360 deg
 //              Steps/deg  = 1280 / 17 ~ 75.294118 steps/deg
-//              Travel     = +/-180 deg = +/-13553 steps
+//              Travel     = +/-40 deg = +/-3012 steps
 //   Tilt Axis: 21T Motor -> 64T Driven (Ratio = 64/21 ~ 3.047619)
 //              Output rev = 3200 * 64 / 21 = 204800 / 21 ~ 9752.38 steps / 360 deg
 //              Steps/deg  = 5120 / 189 ~ 27.089947 steps/deg
-//              Travel     = +/-90 deg = +/-2438 steps
+//              Travel     = +/-45 deg = +/-1219 steps
 // ---------------------------------------------------------------------------
 #define PAN_STEPS_PER_DEG   75.2941f
 #define TILT_STEPS_PER_DEG  27.0899f
 
-#define MAX_PAN_STEPS       13553   // +/-180 deg max travel from center (0)
-#define MAX_TILT_STEPS      2438    // +/-90 deg max travel from center (0)
+#define MAX_PAN_STEPS       3012    // +/-40 deg max travel from center (0)
+#define MAX_TILT_STEPS      1219    // +/-45 deg max travel from center (0)
 
 #define TILT_LEVEL_OFFSET_STEPS  (+160) // ~ +6.0 deg upward adjustment to perfectly level horizon
 
@@ -133,10 +133,10 @@ const char* WIFI_PASS = "windows12";
 // ---------------------------------------------------------------------------
 // Homing Parameters (High-Precision Calibration)
 // ---------------------------------------------------------------------------
-#define HOMING_SEARCH_SPEED_HZ  1800 // Speed for initial sensor search (steps/s)
+#define HOMING_SEARCH_SPEED_HZ  1200 // Controlled speed for reliable sensor detection (steps/s)
 #define HOMING_CREEP_SPEED_HZ    250 // Precision latch speed (steps/s)
-#define HOMING_BACKOFF_STEPS     350 // Optimal backoff to clear magnetic hysteresis without excessive travel
-#define HOMING_ACCEL_HZ_S       8000 // Controlled acceleration during homing
+#define HOMING_BACKOFF_STEPS     250 // Short negative-side backoff to clear magnetic hysteresis
+#define HOMING_ACCEL_HZ_S       6000 // Controlled smooth acceleration during homing
 
 // ---------------------------------------------------------------------------
 // Sony FDR-AX53 IR Zoom Configuration (40 kHz, 15-bit SIRC)
@@ -217,8 +217,8 @@ struct __attribute__((packed)) MountTelemetryPacket {
   int8_t   tiltSide;              // -1 = Down, 0 = Center, +1 = Up
   int32_t  panSteps;              // Current pan position in steps
   int32_t  tiltSteps;             // Current tilt position in steps
-  float    panDeg;                // Calculated pan angle in degrees (-180.0 .. +180.0)
-  float    tiltDeg;               // Calculated tilt angle in degrees (-90.0 .. +90.0)
+  float    panDeg;                // Calculated pan angle in degrees (-40.0 .. +40.0)
+  float    tiltDeg;               // Calculated tilt angle in degrees (-45.0 .. +45.0)
   uint16_t zoomMs;                // Current zoom dead-reckoning position (0..3500 ms)
   uint8_t  zoomPct;               // Zoom percentage (0..100%)
   uint8_t  isHomed;               // 1 if homing complete
@@ -623,8 +623,8 @@ void gotoPreset(uint8_t id) {
   }
 
   currentTargetPreset = id;
-  int32_t targetPan = presets[idx].pan;
-  int32_t targetTilt = presets[idx].tilt;
+  int32_t targetPan = constrain(presets[idx].pan, -MAX_PAN_STEPS, MAX_PAN_STEPS);
+  int32_t targetTilt = constrain(presets[idx].tilt, -MAX_TILT_STEPS, MAX_TILT_STEPS);
 
   int32_t curPan = panStepper ? panStepper->getCurrentPosition() : 0;
   int32_t curTilt = tiltStepper ? tiltStepper->getCurrentPosition() : 0;
@@ -791,13 +791,35 @@ bool checkHomingAbort() {
 }
 
 // ---------------------------------------------------------------------------
-// Bulletproof Precision Simultaneous 2-Axis Homing Engine
+// ---------------------------------------------------------------------------
+// Digital Debounce Helpers for Hall-Effect Sensors (Active LOW)
+// ---------------------------------------------------------------------------
+bool isHallTripped(uint8_t pin) {
+  if (digitalRead(pin) != LOW) return false;
+  for (uint8_t i = 0; i < 3; i++) {
+    delayMicroseconds(50);
+    if (digitalRead(pin) != LOW) return false;
+  }
+  return true;
+}
+
+bool isHallClear(uint8_t pin) {
+  if (digitalRead(pin) != HIGH) return false;
+  for (uint8_t i = 0; i < 3; i++) {
+    delayMicroseconds(50);
+    if (digitalRead(pin) != HIGH) return false;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// High-Precision Bounded Bidirectional Simultaneous 2-Axis Homing Engine
 // ---------------------------------------------------------------------------
 bool homeAxesSimultaneous(int32_t tiltLevelOffset) {
   if (!panStepper || !tiltStepper) return false;
 
   Serial.println("\n=======================================================");
-  Serial.println("[HOMING START] Initializing Simultaneous Precision Calibration");
+  Serial.println("[HOMING START] Initializing Bounded Bidirectional Precision Homing");
   Serial.println("=======================================================");
 
   // Ensure outputs are energized
@@ -806,424 +828,380 @@ bool homeAxesSimultaneous(int32_t tiltLevelOffset) {
   panStepper->setAcceleration(HOMING_ACCEL_HZ_S);
   tiltStepper->setAcceleration(HOMING_ACCEL_HZ_S);
 
+  // Set internal reference positions to 0 at homing entry for bounded travel tracking
+  panStepper->setCurrentPosition(0);
+  tiltStepper->setCurrentPosition(0);
+
+  // Read initial debounced sensor states
+  bool panStartsOnSensor  = isHallTripped(PIN_PAN_HALL);
+  bool tiltStartsOnSensor = isHallTripped(PIN_TILT_HALL);
+
+  Serial.printf("[Homing Init] Pan Sensor: %s | Tilt Sensor: %s\n",
+                panStartsOnSensor ? "TRIGGERED (LOW)" : "CLEAR (HIGH)",
+                tiltStartsOnSensor ? "TRIGGERED (LOW)" : "CLEAR (HIGH)");
+
   // -------------------------------------------------------------------------
-  // Stage 0: Pre-Clear (Back off if already sitting on Hall magnet)
+  // FAST-PATH: Both Hall Sensors already LOW (Sitting directly on magnets)
   // -------------------------------------------------------------------------
-  bool panOnSensor = (digitalRead(PIN_PAN_HALL) == LOW);
-  bool tiltOnSensor = (digitalRead(PIN_TILT_HALL) == LOW);
+  if (panStartsOnSensor && tiltStartsOnSensor) {
+    Serial.println("[Fast-Path] Both axes already on magnet! Executing quick clearance + precision latch (<= 2s)...");
+    sendMountTelemetry("Homing: Fast Latch");
 
-  if (panOnSensor || tiltOnSensor) {
-    Serial.printf("[Stage 0: Pre-Clear] Starting: PanPos=%ld (Hall=%s), TiltPos=%ld (Hall=%s)\n",
-                  panStepper->getCurrentPosition(), panOnSensor ? "ON (LOW)" : "CLEAR (HIGH)",
-                  tiltStepper->getCurrentPosition(), tiltOnSensor ? "ON (LOW)" : "CLEAR (HIGH)");
+    // Short clearance in negative direction (CCW / Down)
+    panStepper->setSpeedInHz(450);
+    tiltStepper->setSpeedInHz(450);
+    panStepper->applySpeedAcceleration();
+    tiltStepper->applySpeedAcceleration();
+    panStepper->moveTo(-600);
+    tiltStepper->moveTo(-600);
 
-    if (panOnSensor) {
-      panStepper->setSpeedInHz(600);
-      panStepper->applySpeedAcceleration();
-      panStepper->runBackward();
-    }
-    if (tiltOnSensor) {
-      tiltStepper->setSpeedInHz(600);
-      tiltStepper->applySpeedAcceleration();
-      tiltStepper->runBackward();
-    }
+    int32_t panClearPos = 0;
+    int32_t tiltClearPos = 0;
+    bool panCleared = false;
+    bool tiltCleared = false;
+    bool panMarginDone = false;
+    bool tiltMarginDone = false;
+    uint32_t fastStartMs = millis();
 
-    uint32_t backoffStart = millis();
-    bool panDone = !panOnSensor;
-    bool tiltDone = !tiltOnSensor;
-    int32_t panClearPos = panStepper->getCurrentPosition();
-    int32_t tiltClearPos = tiltStepper->getCurrentPosition();
-    bool panSawHigh = !panOnSensor;
-    bool tiltSawHigh = !tiltOnSensor;
-
-    while ((!panDone || !tiltDone) && (millis() - backoffStart < 8000)) {
+    while ((!panMarginDone || !tiltMarginDone) && (millis() - fastStartMs < 2000)) {
       if (checkHomingAbort()) {
         panStepper->forceStop();
         tiltStepper->forceStop();
         return false;
       }
-
-      if (!panDone) {
-        if (!panSawHigh && digitalRead(PIN_PAN_HALL) == HIGH) {
-          panSawHigh = true;
-          panClearPos = panStepper->getCurrentPosition();
-        }
-        if (panSawHigh && abs(panStepper->getCurrentPosition() - panClearPos) >= HOMING_BACKOFF_STEPS) {
+      if (!panCleared && isHallClear(PIN_PAN_HALL)) {
+        panCleared = true;
+        panClearPos = panStepper->getCurrentPosition();
+      }
+      if (panCleared && !panMarginDone) {
+        if (abs(panStepper->getCurrentPosition() - panClearPos) >= HOMING_BACKOFF_STEPS || !panStepper->isRunning()) {
           panStepper->forceStop();
-          panDone = true;
+          panMarginDone = true;
         }
       }
-
-      if (!tiltDone) {
-        if (!tiltSawHigh && digitalRead(PIN_TILT_HALL) == HIGH) {
-          tiltSawHigh = true;
-          tiltClearPos = tiltStepper->getCurrentPosition();
-        }
-        if (tiltSawHigh && abs(tiltStepper->getCurrentPosition() - tiltClearPos) >= HOMING_BACKOFF_STEPS) {
+      if (!tiltCleared && isHallClear(PIN_TILT_HALL)) {
+        tiltCleared = true;
+        tiltClearPos = tiltStepper->getCurrentPosition();
+      }
+      if (tiltCleared && !tiltMarginDone) {
+        if (abs(tiltStepper->getCurrentPosition() - tiltClearPos) >= HOMING_BACKOFF_STEPS || !tiltStepper->isRunning()) {
           tiltStepper->forceStop();
-          tiltDone = true;
+          tiltMarginDone = true;
         }
       }
-      delay(1);
+      delayMicroseconds(500);
     }
     panStepper->forceStop();
     tiltStepper->forceStop();
-    delay(150);
-    Serial.printf("[Stage 0 Done] PanPos=%ld (Hall=%s), TiltPos=%ld (Hall=%s)\n",
-                  panStepper->getCurrentPosition(), (digitalRead(PIN_PAN_HALL) == LOW) ? "LOW" : "HIGH",
-                  tiltStepper->getCurrentPosition(), (digitalRead(PIN_TILT_HALL) == LOW) ? "LOW" : "HIGH");
-  }
+    delay(20);
 
-  // -------------------------------------------------------------------------
-  // Stage 1: Simultaneous Fast Search using NVS Initial Guess
-  // -------------------------------------------------------------------------
-  int8_t panDir = (lastPanSide > 0) ? -1 : 1;
-  int8_t tiltDir = (lastTiltSide > 0) ? -1 : 1;
-
-  Serial.printf("\n[Stage 1: Fast Search] Starting @ %u Hz (PanDir=%d, TiltDir=%d) | PanPos=%ld, TiltPos=%ld\n",
-                HOMING_SEARCH_SPEED_HZ, panDir, tiltDir,
-                panStepper->getCurrentPosition(), tiltStepper->getCurrentPosition());
-
-  panStepper->setSpeedInHz(HOMING_SEARCH_SPEED_HZ);
-  panStepper->applySpeedAcceleration();
-  if (panDir > 0) panStepper->runForward();
-  else            panStepper->runBackward();
-
-  tiltStepper->setSpeedInHz(HOMING_SEARCH_SPEED_HZ);
-  tiltStepper->applySpeedAcceleration();
-  if (tiltDir > 0) tiltStepper->runForward();
-  else             tiltStepper->runBackward();
-
-  // Verification move check: ensure motors actually start moving
-  delay(100);
-  int32_t panVerifyPos = panStepper->getCurrentPosition();
-  int32_t tiltVerifyPos = tiltStepper->getCurrentPosition();
-  delay(100);
-  if (abs(panStepper->getCurrentPosition() - panVerifyPos) == 0 && digitalRead(PIN_PAN_HALL) == HIGH) {
-    Serial.println("[Stage 1 WARN] Pan stepper motion re-triggering...");
+    // Precision Creep Latch in Positive Direction (CW / Up)
+    panStepper->setSpeedInHz(HOMING_CREEP_SPEED_HZ);
+    tiltStepper->setSpeedInHz(HOMING_CREEP_SPEED_HZ);
     panStepper->applySpeedAcceleration();
-    if (panDir > 0) panStepper->runForward();
-    else            panStepper->runBackward();
-  }
-  if (abs(tiltStepper->getCurrentPosition() - tiltVerifyPos) == 0 && digitalRead(PIN_TILT_HALL) == HIGH) {
-    Serial.println("[Stage 1 WARN] Tilt stepper motion re-triggering...");
     tiltStepper->applySpeedAcceleration();
-    if (tiltDir > 0) tiltStepper->runForward();
-    else             tiltStepper->runBackward();
-  }
+    panStepper->moveTo(panStepper->getCurrentPosition() + 1000);
+    tiltStepper->moveTo(tiltStepper->getCurrentPosition() + 1000);
 
-  int32_t panStartPos = panStepper->getCurrentPosition();
-  int32_t tiltStartPos = tiltStepper->getCurrentPosition();
+    bool panLatched = false;
+    bool tiltLatched = false;
+    uint32_t latchStartMs = millis();
 
-  bool panFound = (digitalRead(PIN_PAN_HALL) == LOW);
-  bool tiltFound = (digitalRead(PIN_TILT_HALL) == LOW);
-  if (panFound) panStepper->stopMove();
-  if (tiltFound) tiltStepper->stopMove();
-
-  bool panReversed = false;
-  bool tiltReversed = false;
-  uint32_t searchStartMs = millis();
-  uint32_t lastStage1LogMs = 0;
-
-  while ((!panFound || !tiltFound) && (millis() - searchStartMs < 15000)) {
-    uint32_t now = millis();
-    if (checkHomingAbort()) {
-      panStepper->forceStop();
-      tiltStepper->forceStop();
-      return false;
-    }
-
-    // Periodic continuous diagnostic logging (every 300ms)
-    if (now - lastStage1LogMs >= 300) {
-      lastStage1LogMs = now;
-      Serial.printf("[Stage 1 Active] %lums: PanPos=%ld (Hall=%s), TiltPos=%ld (Hall=%s)\n",
-                    now - searchStartMs,
-                    panStepper->getCurrentPosition(), (digitalRead(PIN_PAN_HALL) == LOW) ? "TRIP" : "OK",
-                    tiltStepper->getCurrentPosition(), (digitalRead(PIN_TILT_HALL) == LOW) ? "TRIP" : "OK");
-    }
-
-    // Check Pan Hall
-    if (!panFound) {
-      if (digitalRead(PIN_PAN_HALL) == LOW) {
-        panStepper->stopMove();
-        panFound = true;
-        Serial.printf("[Stage 1] Pan tripped Hall at Pos=%ld!\n", panStepper->getCurrentPosition());
-      } else {
-        int32_t panDist = abs(panStepper->getCurrentPosition() - panStartPos);
-        uint32_t panLimit = panReversed ? (MAX_PAN_STEPS * 2) : MAX_PAN_STEPS;
-        if (panDist >= (int32_t)panLimit) {
-          if (!panReversed) {
-            panReversed = true;
-            panDir = -panDir;
-            panStartPos = panStepper->getCurrentPosition();
-            Serial.printf("[Stage 1] Pan reversing search sweep at Pos=%ld...\n", panStartPos);
-            panStepper->setSpeedInHz(HOMING_SEARCH_SPEED_HZ);
-            panStepper->applySpeedAcceleration();
-            if (panDir > 0) panStepper->runForward();
-            else            panStepper->runBackward();
-          } else {
-            panStepper->forceStop();
-            Serial.println("[Stage 1 ERROR] Pan sweep exceeded limits!");
-            break;
-          }
-        }
-      }
-    }
-
-    // Check Tilt Hall
-    if (!tiltFound) {
-      if (digitalRead(PIN_TILT_HALL) == LOW) {
-        tiltStepper->stopMove();
-        tiltFound = true;
-        Serial.printf("[Stage 1] Tilt tripped Hall at Pos=%ld!\n", tiltStepper->getCurrentPosition());
-      } else {
-        int32_t tiltDist = abs(tiltStepper->getCurrentPosition() - tiltStartPos);
-        uint32_t tiltLimit = tiltReversed ? (MAX_TILT_STEPS * 2) : MAX_TILT_STEPS;
-        if (tiltDist >= (int32_t)tiltLimit) {
-          if (!tiltReversed) {
-            tiltReversed = true;
-            tiltDir = -tiltDir;
-            tiltStartPos = tiltStepper->getCurrentPosition();
-            Serial.printf("[Stage 1] Tilt reversing search sweep at Pos=%ld...\n", tiltStartPos);
-            tiltStepper->setSpeedInHz(HOMING_SEARCH_SPEED_HZ);
-            tiltStepper->applySpeedAcceleration();
-            if (tiltDir > 0) tiltStepper->runForward();
-            else             tiltStepper->runBackward();
-          } else {
-            tiltStepper->forceStop();
-            Serial.println("[Stage 1 ERROR] Tilt sweep exceeded limits!");
-            break;
-          }
-        }
-      }
-    }
-
-    delay(1);
-  }
-
-  while (panStepper->isRunning() || tiltStepper->isRunning()) delay(1);
-
-  if (!panFound || !tiltFound) {
-    panStepper->forceStop();
-    tiltStepper->forceStop();
-    Serial.printf("[Stage 1 FAILED] PanFound=%s (Pos=%ld), TiltFound=%s (Pos=%ld)\n",
-                  panFound ? "YES" : "NO", panStepper->getCurrentPosition(),
-                  tiltFound ? "YES" : "NO", tiltStepper->getCurrentPosition());
-    return false;
-  }
-
-  delay(150);
-  Serial.printf("[Stage 1 Complete] PanPos=%ld, TiltPos=%ld\n",
-                panStepper->getCurrentPosition(), tiltStepper->getCurrentPosition());
-
-  // -------------------------------------------------------------------------
-  // Stage 2: Negative-Side Positioning (Guarantee Identical Final Approach)
-  // -------------------------------------------------------------------------
-  // Move both axes backward (-1 direction) until the Hall sensor is HIGH
-  // AND continue for HOMING_BACKOFF_STEPS (350 steps) past the release point.
-  Serial.printf("\n[Stage 2: Negative Positioning] Starting from PanPos=%ld, TiltPos=%ld\n",
-                panStepper->getCurrentPosition(), tiltStepper->getCurrentPosition());
-
-  panStepper->setSpeedInHz(600);
-  panStepper->applySpeedAcceleration();
-  panStepper->runBackward();
-
-  tiltStepper->setSpeedInHz(600);
-  tiltStepper->applySpeedAcceleration();
-  tiltStepper->runBackward();
-
-  bool panReleased = (digitalRead(PIN_PAN_HALL) == HIGH);
-  int32_t panReleasePos = panStepper->getCurrentPosition();
-  bool tiltReleased = (digitalRead(PIN_TILT_HALL) == HIGH);
-  int32_t tiltReleasePos = tiltStepper->getCurrentPosition();
-
-  bool panRelDone = false;
-  bool tiltRelDone = false;
-  uint32_t relStart = millis();
-  uint32_t lastStage2LogMs = 0;
-
-  while ((!panRelDone || !tiltRelDone) && (millis() - relStart < 8000)) {
-    uint32_t now = millis();
-    if (checkHomingAbort()) {
-      panStepper->forceStop();
-      tiltStepper->forceStop();
-      return false;
-    }
-
-    if (now - lastStage2LogMs >= 300) {
-      lastStage2LogMs = now;
-      Serial.printf("[Stage 2 Active] %lums: PanPos=%ld (Hall=%s, Rel=%s), TiltPos=%ld (Hall=%s, Rel=%s)\n",
-                    now - relStart,
-                    panStepper->getCurrentPosition(), (digitalRead(PIN_PAN_HALL) == LOW) ? "LOW" : "HIGH", panReleased ? "YES" : "NO",
-                    tiltStepper->getCurrentPosition(), (digitalRead(PIN_TILT_HALL) == LOW) ? "LOW" : "HIGH", tiltReleased ? "YES" : "NO");
-    }
-
-    if (!panRelDone) {
-      if (!panReleased && digitalRead(PIN_PAN_HALL) == HIGH) {
-        panReleased = true;
-        panReleasePos = panStepper->getCurrentPosition();
-        Serial.printf("[Stage 2] Pan exited magnet (HIGH) at Pos=%ld\n", panReleasePos);
-      }
-      if (panReleased && (abs(panStepper->getCurrentPosition() - panReleasePos) >= HOMING_BACKOFF_STEPS)) {
+    while ((!panLatched || !tiltLatched) && (millis() - latchStartMs < 2500)) {
+      if (checkHomingAbort()) {
         panStepper->forceStop();
-        panRelDone = true;
-        Serial.printf("[Stage 2] Pan reached negative clearance at Pos=%ld (Backoff=%ld stp)\n",
-                      panStepper->getCurrentPosition(), abs(panStepper->getCurrentPosition() - panReleasePos));
-      }
-    }
-
-    if (!tiltRelDone) {
-      if (!tiltReleased && digitalRead(PIN_TILT_HALL) == HIGH) {
-        tiltReleased = true;
-        tiltReleasePos = tiltStepper->getCurrentPosition();
-        Serial.printf("[Stage 2] Tilt exited magnet (HIGH) at Pos=%ld\n", tiltReleasePos);
-      }
-      if (tiltReleased && (abs(tiltStepper->getCurrentPosition() - tiltReleasePos) >= HOMING_BACKOFF_STEPS)) {
         tiltStepper->forceStop();
-        tiltRelDone = true;
-        Serial.printf("[Stage 2] Tilt reached negative clearance at Pos=%ld (Backoff=%ld stp)\n",
-                      tiltStepper->getCurrentPosition(), abs(tiltStepper->getCurrentPosition() - tiltReleasePos));
+        return false;
       }
-    }
-    delay(1);
-  }
-  panStepper->forceStop();
-  tiltStepper->forceStop();
-  delay(150);
-
-  bool panCleared = (digitalRead(PIN_PAN_HALL) == HIGH);
-  bool tiltCleared = (digitalRead(PIN_TILT_HALL) == HIGH);
-
-  Serial.printf("[Stage 2 Complete] PanPos=%ld (Hall=%s), TiltPos=%ld (Hall=%s)\n",
-                panStepper->getCurrentPosition(), panCleared ? "CLEAR (HIGH)" : "TRIP (LOW)",
-                tiltStepper->getCurrentPosition(), tiltCleared ? "CLEAR (HIGH)" : "TRIP (LOW)");
-
-  if (!panCleared || !tiltCleared) {
-    Serial.println("[Stage 2 FAILED] Sensors not clear on negative side!");
-    return false;
-  }
-
-  // -------------------------------------------------------------------------
-  // Stage 3: Simultaneous Precision Creep (+1 Positive Direction @ 250 Hz)
-  // -------------------------------------------------------------------------
-  // Always approaches from the negative side to positive side.
-  // 15-second timeout allows up to 3750 steps of travel at 250 Hz.
-  Serial.printf("\n[Stage 3: Precision Creep] Creep Starting (+1 Forward @ %u Hz) from PanPos=%ld, TiltPos=%ld\n",
-                HOMING_CREEP_SPEED_HZ, panStepper->getCurrentPosition(), tiltStepper->getCurrentPosition());
-
-  panStepper->setSpeedInHz(HOMING_CREEP_SPEED_HZ);
-  panStepper->applySpeedAcceleration();
-  panStepper->runForward();
-
-  tiltStepper->setSpeedInHz(HOMING_CREEP_SPEED_HZ);
-  tiltStepper->applySpeedAcceleration();
-  tiltStepper->runForward();
-
-  // Verification move check: ensure motors actually start moving in Stage 3
-  delay(120);
-  int32_t panCreepVerifyPos = panStepper->getCurrentPosition();
-  int32_t tiltCreepVerifyPos = tiltStepper->getCurrentPosition();
-  delay(120);
-  if (abs(panStepper->getCurrentPosition() - panCreepVerifyPos) == 0 && digitalRead(PIN_PAN_HALL) == HIGH) {
-    Serial.println("[Stage 3 WARN] Pan creep re-triggering forward command...");
-    panStepper->applySpeedAcceleration();
-    panStepper->runForward();
-  }
-  if (abs(tiltStepper->getCurrentPosition() - tiltCreepVerifyPos) == 0 && digitalRead(PIN_TILT_HALL) == HIGH) {
-    Serial.println("[Stage 3 WARN] Tilt creep re-triggering forward command...");
-    tiltStepper->applySpeedAcceleration();
-    tiltStepper->runForward();
-  }
-
-  bool panLatched = false;
-  bool tiltLatched = false;
-  uint32_t latchStart = millis();
-  uint32_t lastStage3LogMs = 0;
-  int32_t lastPanCreepPos = panStepper->getCurrentPosition();
-  int32_t lastTiltCreepPos = tiltStepper->getCurrentPosition();
-  uint32_t lastPanMoveMs = millis();
-  uint32_t lastTiltMoveMs = millis();
-
-  while ((!panLatched || !tiltLatched) && (millis() - latchStart < 15000)) {
-    uint32_t now = millis();
-    if (checkHomingAbort()) {
-      panStepper->forceStop();
-      tiltStepper->forceStop();
-      return false;
-    }
-
-    // Continuous real-time diagnostic logging every 250ms
-    if (now - lastStage3LogMs >= 250) {
-      lastStage3LogMs = now;
-      Serial.printf("[Stage 3 Creep Active] %lums: PanPos=%ld (Hall=%s, Latch=%s), TiltPos=%ld (Hall=%s, Latch=%s)\n",
-                    now - latchStart,
-                    panStepper->getCurrentPosition(), (digitalRead(PIN_PAN_HALL) == LOW) ? "TRIP" : "OK", panLatched ? "YES" : "NO",
-                    tiltStepper->getCurrentPosition(), (digitalRead(PIN_TILT_HALL) == LOW) ? "TRIP" : "OK", tiltLatched ? "YES" : "NO");
-    }
-
-    // Monitor movement progress to prevent silent stalls
-    if (!panLatched) {
-      int32_t curP = panStepper->getCurrentPosition();
-      if (curP != lastPanCreepPos) {
-        lastPanCreepPos = curP;
-        lastPanMoveMs = now;
-      } else if (now - lastPanMoveMs > 1000) {
-        // Position hasn't changed in 1 second while still unlatched: re-assert runForward
-        Serial.println("[Stage 3 Stall Guard] Re-issuing Pan runForward...");
-        panStepper->applySpeedAcceleration();
-        panStepper->runForward();
-        lastPanMoveMs = now;
-      }
-
-      if (digitalRead(PIN_PAN_HALL) == LOW) {
+      if (!panLatched && isHallTripped(PIN_PAN_HALL)) {
         panStepper->forceStop();
         panLatched = true;
-        Serial.printf("[Stage 3] >>> Pan Precision Latch ACQUIRED at Pos=%ld <<<\n", panStepper->getCurrentPosition());
       }
-    }
-
-    if (!tiltLatched) {
-      int32_t curT = tiltStepper->getCurrentPosition();
-      if (curT != lastTiltCreepPos) {
-        lastTiltCreepPos = curT;
-        lastTiltMoveMs = now;
-      } else if (now - lastTiltMoveMs > 1000) {
-        // Position hasn't changed in 1 second while still unlatched: re-assert runForward
-        Serial.println("[Stage 3 Stall Guard] Re-issuing Tilt runForward...");
-        tiltStepper->applySpeedAcceleration();
-        tiltStepper->runForward();
-        lastTiltMoveMs = now;
-      }
-
-      if (digitalRead(PIN_TILT_HALL) == LOW) {
+      if (!tiltLatched && isHallTripped(PIN_TILT_HALL)) {
         tiltStepper->forceStop();
         tiltLatched = true;
-        Serial.printf("[Stage 3] >>> Tilt Precision Latch ACQUIRED at Pos=%ld <<<\n", tiltStepper->getCurrentPosition());
+      }
+      delayMicroseconds(300);
+    }
+    panStepper->forceStop();
+    tiltStepper->forceStop();
+
+    if (panLatched && tiltLatched) {
+      Serial.println("[Fast-Path SUCCESS] Both axes precision latched!");
+
+      // Stage 4: Apply Horizon Leveling Offset to Tilt
+      if (tiltLevelOffset != 0) {
+        tiltStepper->setCurrentPosition(0);
+        tiltStepper->setSpeedInHz(400);
+        tiltStepper->applySpeedAcceleration();
+        tiltStepper->moveTo(tiltLevelOffset);
+        while (tiltStepper->isRunning()) {
+          if (checkHomingAbort()) {
+            tiltStepper->forceStop();
+            return false;
+          }
+          delay(1);
+        }
+      }
+
+      panStepper->setCurrentPosition(0);
+      tiltStepper->setCurrentPosition(0);
+      panStepper->setSpeedInHz(MAX_SPEED_HZ);
+      tiltStepper->setSpeedInHz(MAX_SPEED_HZ);
+      panStepper->setAcceleration(ACCEL_HZ_S);
+      tiltStepper->setAcceleration(ACCEL_HZ_S);
+      panStepper->applySpeedAcceleration();
+      tiltStepper->applySpeedAcceleration();
+
+      savePanSideNVS(0);
+      saveTiltSideNVS(0);
+      Serial.println("[HOMING COMPLETE] Fast-path calibrated in <= 2s.\n");
+      return true;
+    }
+    Serial.println("[Fast-Path Note] Falling through to full bounded bidirectional search.");
+  }
+
+  // -------------------------------------------------------------------------
+  // GENERAL HOMING: Coordinated Multi-Stage Bounded Bidirectional Search
+  // -------------------------------------------------------------------------
+
+  enum AxisHomingState {
+    AXIS_PRE_CLEAR,      // If started on sensor: back off negative until clear + margin
+    AXIS_SEARCH_PRI,     // Sweep in primary direction (from NVS) up to 1x MAX_STEPS
+    AXIS_SEARCH_REV,     // Sweep in reverse direction up to 2x MAX_STEPS across origin to opposite limit
+    AXIS_BACKOFF_NEG,    // Back off negative until fully clear + margin
+    AXIS_CREEP_LATCH,    // Creep positive slowly to latch magnet edge
+    AXIS_LATCHED,        // Axis successfully zeroed
+    AXIS_FAILED          // Axis failed to find magnet within full bidirectional bounds
+  };
+
+  AxisHomingState panState  = panStartsOnSensor  ? AXIS_PRE_CLEAR : AXIS_SEARCH_PRI;
+  AxisHomingState tiltState = tiltStartsOnSensor ? AXIS_PRE_CLEAR : AXIS_SEARCH_PRI;
+
+  // Primary search directions determined by NVS memory
+  // (+1 = was positive side -> search Negative/CCW; -1 = was negative side -> search Positive/CW; 0 = search Negative)
+  int8_t panPriDir  = (lastPanSide > 0)  ? -1 : ((lastPanSide < 0)  ? 1 : -1);
+  int8_t tiltPriDir = (lastTiltSide > 0) ? -1 : ((lastTiltSide < 0) ? 1 : -1);
+
+  int32_t panClearRefPos  = 0;
+  int32_t tiltClearRefPos = 0;
+  bool panClearSawHigh    = false;
+  bool tiltClearSawHigh   = false;
+
+  Serial.printf("[Homing Plan] Pan PriDir: %s (NVS=%d) | Tilt PriDir: %s (NVS=%d)\n",
+                (panPriDir > 0) ? "FORWARD (CW)" : "BACKWARD (CCW)", lastPanSide,
+                (tiltPriDir > 0) ? "FORWARD (UP)" : "BACKWARD (DOWN)", lastTiltSide);
+
+  sendMountTelemetry("Homing: Searching");
+
+  // Helper lambda to assign and begin new movement for an axis state
+  auto applyAxisState = [&](char axis, AxisHomingState state) {
+    FastAccelStepper* stp = (axis == 'P') ? panStepper : tiltStepper;
+    int32_t maxSteps = (axis == 'P') ? MAX_PAN_STEPS : MAX_TILT_STEPS;
+    int8_t priDir = (axis == 'P') ? panPriDir : tiltPriDir;
+
+    if (state == AXIS_PRE_CLEAR) {
+      stp->setSpeedInHz(450);
+      stp->applySpeedAcceleration();
+      stp->moveTo(stp->getCurrentPosition() - (maxSteps / 4));
+      if (axis == 'P') { panClearSawHigh = false; panClearRefPos = stp->getCurrentPosition(); }
+      else             { tiltClearSawHigh = false; tiltClearRefPos = stp->getCurrentPosition(); }
+    } else if (state == AXIS_SEARCH_PRI) {
+      stp->setSpeedInHz(HOMING_SEARCH_SPEED_HZ);
+      stp->applySpeedAcceleration();
+      int32_t target = priDir * maxSteps;
+      stp->moveTo(target);
+      Serial.printf("[%s Search Pri] Moving to %ld (Limit: %ld stp)\n",
+                    (axis == 'P') ? "Pan" : "Tilt", target, maxSteps);
+    } else if (state == AXIS_SEARCH_REV) {
+      stp->setSpeedInHz(HOMING_SEARCH_SPEED_HZ);
+      stp->applySpeedAcceleration();
+      int32_t target = -priDir * maxSteps;
+      stp->moveTo(target);
+      Serial.printf("[%s Search Rev] Full reverse sweep to opposite limit %ld\n",
+                    (axis == 'P') ? "Pan" : "Tilt", target);
+    } else if (state == AXIS_BACKOFF_NEG) {
+      stp->setSpeedInHz(500);
+      stp->applySpeedAcceleration();
+      stp->moveTo(stp->getCurrentPosition() - (maxSteps / 4));
+      if (axis == 'P') { panClearSawHigh = false; panClearRefPos = stp->getCurrentPosition(); }
+      else             { tiltClearSawHigh = false; tiltClearRefPos = stp->getCurrentPosition(); }
+    } else if (state == AXIS_CREEP_LATCH) {
+      stp->setSpeedInHz(HOMING_CREEP_SPEED_HZ);
+      stp->applySpeedAcceleration();
+      stp->moveTo(stp->getCurrentPosition() + (maxSteps / 2));
+    }
+  };
+
+  // Launch initial motions for both axes
+  applyAxisState('P', panState);
+  applyAxisState('T', tiltState);
+
+  uint32_t homingLoopStartMs = millis();
+  const uint32_t HOMING_MAX_TIMEOUT_MS = 50000; // Generous 50-second watchdog for complete bidirectional sweep
+
+  while ((panState != AXIS_LATCHED && panState != AXIS_FAILED) ||
+         (tiltState != AXIS_LATCHED && tiltState != AXIS_FAILED)) {
+
+    if (checkHomingAbort()) {
+      panStepper->forceStop();
+      tiltStepper->forceStop();
+      return false;
+    }
+
+    if (millis() - homingLoopStartMs > HOMING_MAX_TIMEOUT_MS) {
+      Serial.println("\n[HOMING ERROR] Overall homing watchdog timeout exceeded! Stopping all motors.");
+      panStepper->forceStop();
+      tiltStepper->forceStop();
+      return false;
+    }
+
+    // -----------------------------------------------------------------------
+    // PAN AXIS STATE MACHINE
+    // -----------------------------------------------------------------------
+    if (panState == AXIS_PRE_CLEAR) {
+      if (!panClearSawHigh && isHallClear(PIN_PAN_HALL)) {
+        panClearSawHigh = true;
+        panClearRefPos = panStepper->getCurrentPosition();
+      }
+      if (panClearSawHigh && (abs(panStepper->getCurrentPosition() - panClearRefPos) >= HOMING_BACKOFF_STEPS || !panStepper->isRunning())) {
+        panStepper->forceStop();
+        Serial.printf("[Pan Pre-Clear Done] Pos: %ld. Transitioning to Precision Creep Latch.\n", panStepper->getCurrentPosition());
+        panState = AXIS_CREEP_LATCH;
+        applyAxisState('P', panState);
+      } else if (!panStepper->isRunning() && !panClearSawHigh) {
+        panState = AXIS_SEARCH_PRI;
+        applyAxisState('P', panState);
+      }
+    } else if (panState == AXIS_SEARCH_PRI) {
+      if (isHallTripped(PIN_PAN_HALL)) {
+        panStepper->forceStop();
+        Serial.printf("[Pan Magnet Detected in PriSearch] Pos: %ld. Backing off negative.\n", panStepper->getCurrentPosition());
+        panState = AXIS_BACKOFF_NEG;
+        applyAxisState('P', panState);
+      } else if (!panStepper->isRunning()) {
+        Serial.printf("[Pan PriSearch Limit Reached (%ld stp)] Reversing search direction.\n", panStepper->getCurrentPosition());
+        panState = AXIS_SEARCH_REV;
+        applyAxisState('P', panState);
+      }
+    } else if (panState == AXIS_SEARCH_REV) {
+      if (isHallTripped(PIN_PAN_HALL)) {
+        panStepper->forceStop();
+        Serial.printf("[Pan Magnet Detected in RevSearch] Pos: %ld. Backing off negative.\n", panStepper->getCurrentPosition());
+        panState = AXIS_BACKOFF_NEG;
+        applyAxisState('P', panState);
+      } else if (!panStepper->isRunning()) {
+        Serial.printf("[Pan ERROR] Full bidirectional sweep completed with no magnet detected! Pos: %ld\n", panStepper->getCurrentPosition());
+        panState = AXIS_FAILED;
+      }
+    } else if (panState == AXIS_BACKOFF_NEG) {
+      if (!panClearSawHigh && isHallClear(PIN_PAN_HALL)) {
+        panClearSawHigh = true;
+        panClearRefPos = panStepper->getCurrentPosition();
+      }
+      if (panClearSawHigh && (abs(panStepper->getCurrentPosition() - panClearRefPos) >= HOMING_BACKOFF_STEPS || !panStepper->isRunning())) {
+        panStepper->forceStop();
+        Serial.printf("[Pan Backoff Done] Pos: %ld. Starting Precision Creep Latch.\n", panStepper->getCurrentPosition());
+        panState = AXIS_CREEP_LATCH;
+        applyAxisState('P', panState);
+      } else if (!panStepper->isRunning() && !panClearSawHigh) {
+        panState = AXIS_CREEP_LATCH;
+        applyAxisState('P', panState);
+      }
+    } else if (panState == AXIS_CREEP_LATCH) {
+      if (isHallTripped(PIN_PAN_HALL)) {
+        panStepper->forceStop();
+        Serial.printf("[Pan LATCHED SUCCESS] Center Zero Edge Latched at Pos: %ld\n", panStepper->getCurrentPosition());
+        panState = AXIS_LATCHED;
+      } else if (!panStepper->isRunning()) {
+        Serial.println("[Pan ERROR] Precision creep finished without detecting magnet edge!");
+        panState = AXIS_FAILED;
       }
     }
-    delay(1);
+
+    // -----------------------------------------------------------------------
+    // TILT AXIS STATE MACHINE
+    // -----------------------------------------------------------------------
+    if (tiltState == AXIS_PRE_CLEAR) {
+      if (!tiltClearSawHigh && isHallClear(PIN_TILT_HALL)) {
+        tiltClearSawHigh = true;
+        tiltClearRefPos = tiltStepper->getCurrentPosition();
+      }
+      if (tiltClearSawHigh && (abs(tiltStepper->getCurrentPosition() - tiltClearRefPos) >= HOMING_BACKOFF_STEPS || !tiltStepper->isRunning())) {
+        tiltStepper->forceStop();
+        Serial.printf("[Tilt Pre-Clear Done] Pos: %ld. Transitioning to Precision Creep Latch.\n", tiltStepper->getCurrentPosition());
+        tiltState = AXIS_CREEP_LATCH;
+        applyAxisState('T', tiltState);
+      } else if (!tiltStepper->isRunning() && !tiltClearSawHigh) {
+        tiltState = AXIS_SEARCH_PRI;
+        applyAxisState('T', tiltState);
+      }
+    } else if (tiltState == AXIS_SEARCH_PRI) {
+      if (isHallTripped(PIN_TILT_HALL)) {
+        tiltStepper->forceStop();
+        Serial.printf("[Tilt Magnet Detected in PriSearch] Pos: %ld. Backing off negative.\n", tiltStepper->getCurrentPosition());
+        tiltState = AXIS_BACKOFF_NEG;
+        applyAxisState('T', tiltState);
+      } else if (!tiltStepper->isRunning()) {
+        Serial.printf("[Tilt PriSearch Limit Reached (%ld stp)] Reversing search direction.\n", tiltStepper->getCurrentPosition());
+        tiltState = AXIS_SEARCH_REV;
+        applyAxisState('T', tiltState);
+      }
+    } else if (tiltState == AXIS_SEARCH_REV) {
+      if (isHallTripped(PIN_TILT_HALL)) {
+        tiltStepper->forceStop();
+        Serial.printf("[Tilt Magnet Detected in RevSearch] Pos: %ld. Backing off negative.\n", tiltStepper->getCurrentPosition());
+        tiltState = AXIS_BACKOFF_NEG;
+        applyAxisState('T', tiltState);
+      } else if (!tiltStepper->isRunning()) {
+        Serial.printf("[Tilt ERROR] Full bidirectional sweep completed with no magnet detected! Pos: %ld\n", tiltStepper->getCurrentPosition());
+        tiltState = AXIS_FAILED;
+      }
+    } else if (tiltState == AXIS_BACKOFF_NEG) {
+      if (!tiltClearSawHigh && isHallClear(PIN_TILT_HALL)) {
+        tiltClearSawHigh = true;
+        tiltClearRefPos = tiltStepper->getCurrentPosition();
+      }
+      if (tiltClearSawHigh && (abs(tiltStepper->getCurrentPosition() - tiltClearRefPos) >= HOMING_BACKOFF_STEPS || !tiltStepper->isRunning())) {
+        tiltStepper->forceStop();
+        Serial.printf("[Tilt Backoff Done] Pos: %ld. Starting Precision Creep Latch.\n", tiltStepper->getCurrentPosition());
+        tiltState = AXIS_CREEP_LATCH;
+        applyAxisState('T', tiltState);
+      } else if (!tiltStepper->isRunning() && !tiltClearSawHigh) {
+        tiltState = AXIS_CREEP_LATCH;
+        applyAxisState('T', tiltState);
+      }
+    } else if (tiltState == AXIS_CREEP_LATCH) {
+      if (isHallTripped(PIN_TILT_HALL)) {
+        tiltStepper->forceStop();
+        Serial.printf("[Tilt LATCHED SUCCESS] Center Zero Edge Latched at Pos: %ld\n", tiltStepper->getCurrentPosition());
+        tiltState = AXIS_LATCHED;
+      } else if (!tiltStepper->isRunning()) {
+        Serial.println("[Tilt ERROR] Precision creep finished without detecting magnet edge!");
+        tiltState = AXIS_FAILED;
+      }
+    }
+
+    delayMicroseconds(300);
   }
 
-  panStepper->forceStop();
-  tiltStepper->forceStop();
-
-  if (!panLatched || !tiltLatched) {
-    Serial.printf("[Stage 3 FAILED] Precision creep timeout! PanLatched=%s (Pos=%ld, Hall=%s), TiltLatched=%s (Pos=%ld, Hall=%s)\n",
-                  panLatched ? "YES" : "NO", panStepper->getCurrentPosition(), (digitalRead(PIN_PAN_HALL) == LOW) ? "LOW" : "HIGH",
-                  tiltLatched ? "YES" : "NO", tiltStepper->getCurrentPosition(), (digitalRead(PIN_TILT_HALL) == LOW) ? "LOW" : "HIGH");
+  // Check if any axis failed
+  if (panState == AXIS_FAILED || tiltState == AXIS_FAILED) {
+    Serial.printf("\n[HOMING FAILED] Calibration incomplete! PanState=%d, TiltState=%d\n", panState, tiltState);
+    panStepper->forceStop();
+    tiltStepper->forceStop();
+    sendMountTelemetry("Homing: FAILED");
     return false;
   }
-
-  delay(150);
 
   // -------------------------------------------------------------------------
   // Stage 4: Apply Horizon Leveling Offset to Tilt
   // -------------------------------------------------------------------------
   if (tiltLevelOffset != 0) {
-    Serial.printf("\n[Stage 4: Level Offset] Applying Tilt offset: %+ld steps from Pos=%ld...\n",
-                  tiltLevelOffset, tiltStepper->getCurrentPosition());
+    Serial.printf("\n[Stage 4: Level Offset] Applying Tilt offset: %+ld steps...\n", tiltLevelOffset);
+    sendMountTelemetry("Homing: Leveling");
     tiltStepper->setCurrentPosition(0);
-    tiltStepper->setSpeedInHz(350);
+    tiltStepper->setSpeedInHz(400);
     tiltStepper->applySpeedAcceleration();
     tiltStepper->moveTo(tiltLevelOffset);
     while (tiltStepper->isRunning()) {
@@ -1233,7 +1211,7 @@ bool homeAxesSimultaneous(int32_t tiltLevelOffset) {
       }
       delay(1);
     }
-    delay(50);
+    delay(30);
     Serial.printf("[Stage 4 Done] Tilt Level Offset Position: %ld steps\n", tiltStepper->getCurrentPosition());
   }
 
@@ -1260,10 +1238,10 @@ bool homeAxesSimultaneous(int32_t tiltLevelOffset) {
   Serial.println("  Zoom Axis : 0.0% Wide (Physical Lens Stop Latched)");
   Serial.println("=======================================================\n");
 
+  sendMountTelemetry("Homing Complete");
   return true;
 }
 
-// FreeRTOS task for concurrent Zoom Homing (Runs in parallel on Core 0)
 void zoomHomingTask(void* pvParameters) {
   Serial.printf("[Zoom Homing Task] Started: Driving Wide to physical lens stop (%u ms)...\n", ZOOM_HOMING_TIME_MS);
   g_irActiveCmd = SONY_IR_CMD_ZOOM_WIDE;
@@ -1512,7 +1490,7 @@ void setup() {
                 PIN_TILT_EN, PIN_TILT_STEP, PIN_TILT_DIR, PIN_TILT_TX, PIN_TILT_RX);
   Serial.printf("   IR Transmit : GPIO %d (40 kHz Sony 15-bit SIRC)\n", PIN_IR_IN);
   Serial.printf("   Sensors     : Pan Hall=GPIO %d, Tilt Hall=GPIO %d\n", PIN_PAN_HALL, PIN_TILT_HALL);
-  Serial.printf("   Travel Limit: Pan +/-180 deg (%u steps), Tilt +/-90 deg (%u steps)\n",
+  Serial.printf("   Travel Limit: Pan +/-40 deg (%u steps), Tilt +/-45 deg (%u steps)\n",
                 MAX_PAN_STEPS, MAX_TILT_STEPS);
   Serial.println("====================================================================");
 
@@ -1693,23 +1671,7 @@ void loop() {
     Serial.println("[LINK WARNING] Link timeout - motors and zoom safely stopped");
   }
 
-  // 4. Hall Sensor Edge Detection (Instant Telemetry Event)
-  static bool lastPanHallEdge = false;
-  static bool lastTiltHallEdge = false;
-  bool panHallNow = (digitalRead(PIN_PAN_HALL) == LOW);
-  bool tiltHallNow = (digitalRead(PIN_TILT_HALL) == LOW);
-
-  if (panHallNow != lastPanHallEdge) {
-    lastPanHallEdge = panHallNow;
-    if (panHallNow) sendMountTelemetry("Pan Hall: DETECTED (At Center)");
-    else            sendMountTelemetry("Pan Hall: CLEARED (Away)");
-  }
-
-  if (tiltHallNow != lastTiltHallEdge) {
-    lastTiltHallEdge = tiltHallNow;
-    if (tiltHallNow) sendMountTelemetry("Tilt Hall: DETECTED (At Center)");
-    else             sendMountTelemetry("Tilt Hall: CLEARED (Away)");
-  }
+  // 4. (Hall sensor state is broadcast silently in every periodic telemetry heartbeat — no separate edge events)
 
   // 5. Periodic UART & System Telemetry Heartbeat (every 2.5 seconds to remote)
   static uint32_t lastTelemetryMs = 0;
@@ -1724,6 +1686,9 @@ void loop() {
 
     // Send telemetry to remote
     sendMountTelemetry();
+
+    bool panHallNow  = (digitalRead(PIN_PAN_HALL)  == LOW);
+    bool tiltHallNow = (digitalRead(PIN_TILT_HALL) == LOW);
 
     int32_t pPos = panStepper  ? panStepper->getCurrentPosition()  : 0;
     int32_t tPos = tiltStepper ? tiltStepper->getCurrentPosition() : 0;
